@@ -13,6 +13,7 @@ No root permissions, no writes, and no system settings are touched.
 - One-shot dashboard or live-refreshing watch mode.
 - Watch mode adds live-only details:
   - Network RX/TX totals and throughput rates.
+  - Live CPU usage even when `/proc/stat` is frozen (via per-process CPU time).
   - Running/total process counts.
   - Top processes by CPU, with a `/proc` fallback sorted by memory.
   - Sample counter, session duration, and refresh status.
@@ -104,7 +105,7 @@ When `--watch` is used without an interactive terminal, sysmon prints one snapsh
 
 `sysmon -w` refreshes the dashboard in an alternate screen and adds three live-only things:
 
-1. **Network** — RX/TX totals plus bytes-per-second rates. Loopback is excluded when other interfaces are present. The first frame says `rate pending`; later frames use counter deltas.
+1. **Network** — RX/TX totals plus bytes-per-second rates. Loopback is excluded when other interfaces are present. The first frame says `rate pending`; later frames use counter deltas. Sources are tried in order: `/proc/net/dev`, `/sys/class/net`, Android's `netstats` binder service (via `service call netstats 13`), then `ip -s -j link`.
 2. **Processes** — running/total counts from `/proc`, plus the five busiest processes. CPU percentages come from `ps`; if `ps` is missing or unsupported, sysmon falls back to the five processes with the largest resident memory from `/proc` (CPU shows `n/a`).
 3. **Session footer** — refresh interval, sample number, and how long the watch session has been running.
 
@@ -114,11 +115,11 @@ The footer looks like:
 Ctrl+C to quit  ·  refresh 2s  ·  sample #12  ·  watching 24s
 ```
 
-Network accounting requires a readable `/proc/net/dev`. Some Android/PRoot setups block it; sysmon then shows `Network data unavailable` and a warning. Process details and session status still work. `ps` CPU values are lifetime averages, not a separate sampling window.
+On standard Linux, network accounting uses `/proc/net/dev`. Android denies unprivileged apps access to it, so sysmon falls back to the `netstats` binder service and can still show device-wide RX/TX totals and rates. If every source is blocked, sysmon shows `Network data unavailable` and a warning. Process details and session status still work. `ps` CPU values are lifetime averages, not a separate sampling window.
 
 ## Example output
 
-The layout below is from this workspace at 100 columns. In this PRoot environment `/proc/stat` counters are static, so CPU usage falls back to the average since boot and is labelled `boot avg`.
+The layout below is from this workspace at 100 columns. In this PRoot environment `/proc/stat` counters are static, so CPU usage is derived from per-process CPU time and labelled accordingly. `/proc/net/dev` is blocked, so the Network panel uses Android's `netstats` service.
 
 ```text
 sysmon  system monitor                                                           2026-10-21 21:32:02
@@ -128,7 +129,7 @@ localhost · Ubuntu 26.04.1 LTS · aarch64
 │ load 1/5/15 0.12 / 0.07 / 0.02                │ │ RAM   ████████░░░░░░░░ 49.8%                   │
 │ usage       █░░░░░░░░░░░░░░░ 5.6%             │ │       5.5 GiB used / 11.1 GiB total            │
 │ cores       8                                 │ │ SWAP  ███████████░░░░░ 70.1%                   │
-╰─ src: /proc/loadavg + /proc/stat (boot avg) ──╯ │       5.6 GiB used / 8.0 GiB total             │
+╰─ src: /proc/loadavg + /proc/[pid]/stat ───────╯ │       5.6 GiB used / 8.0 GiB total             │
                                                   ╰─ src: /proc/meminfo ───────────────────────────╯
 ╭─ Disk ────────────────────────────────────────╮ ╭─ Uptime ───────────────────────────────────────╮
 │ /                                             │ │ 2m 4s                                          │
@@ -146,8 +147,8 @@ In live mode, two more panels are added below them:
 ╭─ Network ─────────────────────────────────────╮ ╭─ Processes ────────────────────────────────────╮
 │ RX  5.0 GiB total   33.2 KiB/s                │ │ 2 running · 42 processes                       │
 │ TX  2.0 GiB total   8.3 KiB/s                 │ │    PID  COMMAND                CPU         MEM │
-│     2 interfaces                              │ │   1234  python               12.5%   512.0 MiB │
-╰─ src: /proc/net/dev ──────────────────────────╯ │   5678  opencode              6.1%   322.0 MiB │
+│                                               │ │   1234  python               12.5%   512.0 MiB │
+╰─ src: android netstats ───────────────────────╯ │   5678  opencode              6.1%   322.0 MiB │
                                                   │   9012  bash                  0.4%    64.0 MiB │
                                                   │   3456  node                  0.2%   128.0 MiB │
                                                   │   7890  sshd                  0.1%    12.0 MiB │
@@ -164,11 +165,11 @@ sysmon is read-only. It prefers `/proc` and the Python standard library, then fa
 | Metric | Primary source | Fallback | If everything fails |
 | --- | --- | --- | --- |
 | CPU load | `/proc/loadavg` | `os.getloadavg()` | `n/a` + warning |
-| CPU usage | `/proc/stat` delta | `/proc/stat` average since boot when counters do not advance | `n/a` + warning |
+| CPU usage | `/proc/stat` delta | per-process `/proc/[pid]/stat` CPU-time delta, then `/proc/stat` average since boot | `n/a` + warning |
 | Memory / swap | `/proc/meminfo` | `free -b` | `n/a` + warning |
 | Disk | `shutil.disk_usage` (`statvfs`) | `df -Pk PATH` | skipped path + warning |
 | Uptime | `/proc/uptime` | `uptime -s` | `n/a` + warning |
-| Network (watch/JSON) | `/proc/net/dev` | none | `n/a` + warning |
+| Network (watch/JSON) | `/proc/net/dev` | `/sys/class/net`, Android `netstats`, `ip -s -j link` | `n/a` + warning |
 | Process counts (watch/JSON) | `/proc/[pid]/stat` | none | `n/a` |
 | Top processes (watch/JSON) | `ps -eo pid=,pcpu=,rss=,comm=` | `/proc/[pid]/statm` sorted by RSS | panel unavailable |
 
@@ -179,7 +180,7 @@ External commands:
 - Are optional: `free`, `df`, and `uptime` are fallbacks, while `ps` supplies top-process CPU data.
 - Never block the app from starting when missing.
 
-CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can be under PRoot/Android, sysmon shows the average since boot with an explicit source label rather than inventing an instantaneous value. Network totals need a readable `/proc/net/dev`; process statistics still work when Android blocks it.
+CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can be under PRoot/Android, sysmon computes usage from per-process CPU-time deltas and labels the source accordingly. Only if those counters are also unavailable does it show the average since boot. Network totals prefer `/proc/net/dev` and fall back to sysfs, Android's `netstats` binder service, or `ip -s -j link`, so the panel can still work when Android blocks procfs. Process statistics remain independent of network access.
 
 ## JSON
 
@@ -195,7 +196,7 @@ CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can b
     "load_15m": 0.02,
     "usage_percent": 5.6,
     "cores": 8,
-    "source": "/proc/loadavg + /proc/stat (boot avg)"
+    "source": "/proc/loadavg + /proc/[pid]/stat"
   },
   "memory": {
     "total_bytes": 11894140928,
@@ -222,8 +223,8 @@ CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can b
     "tx_bytes": 2147483648,
     "rx_bytes_per_sec": null,
     "tx_bytes_per_sec": null,
-    "interfaces": 2,
-    "source": "/proc/net/dev"
+    "interfaces": 0,
+    "source": "android netstats"
   },
   "processes": {
     "total": 42,
@@ -254,9 +255,9 @@ python -m pytest
 The suite covers:
 
 - Byte/duration/percent/rate formatting.
-- `/proc/loadavg`, `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net/dev`, `ps`, `df -Pk`, `free -b`, and `os-release` parsing.
-- CPU delta and since-boot calculations.
-- Network rate calculations across samples.
+- `/proc/loadavg`, `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net/dev`, `/sys/class/net`, `ip -s -j link`, Android `netstats`, `ps`, `df -Pk`, `free -b`, and `os-release` parsing.
+- CPU delta, since-boot, and per-process CPU-time calculations.
+- Network rate calculations across samples and network source fallbacks.
 - Process counts and `/proc` top-process fallback.
 - Command fallbacks with a fake runner.
 - Missing `/proc` files and missing utilities, asserting warnings instead of crashes.
@@ -266,8 +267,8 @@ The suite covers:
 Current result on Ubuntu 26.04 aarch64 / Python 3.14 / Rich 15:
 
 ```text
-...........................................................
-59 passed
+........................................................................
+72 passed
 ```
 
 Interactive watch was also exercised under a pseudo-terminal: it rendered multiple live frames with network/process/session panels, handled `Ctrl+C`, printed `sysmon stopped.`, and exited with code 0.
@@ -303,21 +304,21 @@ To add a metric:
 ## Limitations and notes
 
 - **No root**: sysmon only reads files and calls read-only utilities. It does not change kernel settings, files, or services.
-- **Container values**: inside PRoot, `/proc` reflects the shared kernel/container view, not necessarily every Android host statistic. Frozen `/proc/stat` counters are handled with the boot-average fallback.
+- **Container values**: inside PRoot, `/proc` reflects the shared kernel/container view, not necessarily every Android host statistic. Frozen `/proc/stat` counters are handled with per-process CPU-time deltas (then the boot average as a last resort).
 - **Restricted storage**: Android scoped storage may block paths such as `/sdcard`. Point `--path` at an accessible directory; inaccessible paths appear as warnings.
-- **Restricted networking**: Android and some PRoot setups deny access to `/proc/net/dev`; the Network panel then shows unavailable and a warning. Network accounting works on standard Ubuntu hosts.
+- **Restricted networking**: Android and some PRoot setups deny access to `/proc/net/dev` and `/sys/class/net`. sysmon then queries the `netstats` binder service via `service call netstats 13`; if that is blocked too, the Network panel shows unavailable and a warning.
 - **No history**: there are no charts or retained samples. Each refresh is independent; only network rates need the previous sample.
 - **Process scope**: watch mode shows counts and the top five processes, not a full process browser. `ps` CPU percentages are lifetime averages; the `/proc` fallback ranks by resident memory and leaves CPU as `n/a`.
 - **Disk space semantics**: usage comes from `statvfs` when possible, so reserved blocks can make `used + free` differ slightly from `total`.
 - **Colors**: Rich disables color automatically when output is redirected. Use `--no-color` or `--ascii` on limited terminals.
-- **Sampling cost**: one snapshot blocks for about `0.12s` to measure CPU usage. Detailed watch/JSON collection also runs process and network queries, so watch mode enforces a minimum interval of `0.5s`.
+- **Sampling cost**: one snapshot blocks for about `0.12s` to measure CPU usage. Detailed watch/JSON collection also runs process and network queries; Android `netstats` can add roughly `0.1-0.3s`, so watch mode enforces a minimum interval of `0.5s`.
 
 ## Troubleshooting
 
 - `ModuleNotFoundError: No module named 'rich'`: install `requirements.txt` with the same Python interpreter used to run sysmon (activate the venv first).
 - `ensurepip is not available` in Ubuntu: install `python3-venv` once, then recreate `.venv`.
-- CPU usage shows `n/a`: `/proc/stat` is unreadable. CPU load can still be shown if `/proc/loadavg` or `os.getloadavg()` works.
-- Network shows unavailable: `/proc/net/dev` is blocked by the Android/proot sandbox. This is expected in some Termux setups; the rest of the dashboard still works.
+- CPU usage shows `n/a`: `/proc/stat` is unreadable and per-process CPU counters in `/proc/[pid]/stat` cannot be read either. CPU load can still be shown if `/proc/loadavg` or `os.getloadavg()` works.
+- Network shows unavailable: `/proc/net/dev`, `/sys/class/net`, Android's `netstats` service, and `ip -s -j link` all failed. This can happen in locked-down Termux/proot setups; the rest of the dashboard still works. On Android, check that `/system/bin/service` is visible inside the container.
 - Processes show `n/a` for CPU: `ps` is unavailable or incompatible, so top processes come from `/proc` memory usage.
 - Disk panel shows a warning: the path is not visible to the current user/container. Try `--path "$HOME"`.
 - Watch mode exits immediately: stdout is not a TTY. Run it directly in Termux, not through a pipe or log redirect.

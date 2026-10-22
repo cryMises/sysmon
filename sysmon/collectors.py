@@ -8,6 +8,7 @@ dashboard.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import platform
@@ -15,7 +16,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -195,6 +196,49 @@ def calculate_cpu_usage_since_boot(times: CpuTimes) -> float | None:
     return max(0.0, min(100.0, usage))
 
 
+def calculate_process_cpu_usage(
+    before: Mapping[int, int] | None,
+    after: Mapping[int, int] | None,
+    elapsed: float,
+    cores: int | None,
+    clock_ticks: int = 100,
+) -> float | None:
+    """Estimate CPU usage from per-process utime/stime deltas.
+
+    Some containers (notably PRoot on Android) expose a frozen ``/proc/stat``
+    while still accounting CPU time for individual processes. Summing the
+    deltas for processes present in both samples recovers a live usage value.
+    """
+
+    if (
+        not before
+        or not after
+        or elapsed <= 0
+        or not cores
+        or cores <= 0
+        or clock_ticks <= 0
+    ):
+        return None
+
+    common_pids = set(before).intersection(after)
+    if not common_pids:
+        return None
+
+    delta_ticks = sum(max(0, after[pid] - before[pid]) for pid in common_pids)
+    usage = delta_ticks / clock_ticks / elapsed / cores * 100.0
+    return max(0.0, min(100.0, usage))
+
+
+def _clock_ticks() -> int:
+    """Return the kernel's clock tick rate, defaulting to the Linux norm."""
+
+    try:
+        ticks = int(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError):
+        return 100
+    return ticks if ticks > 0 else 100
+
+
 def parse_uptime(text: str) -> float:
     fields = text.split()
     if not fields:
@@ -259,6 +303,21 @@ def parse_os_release(text: str) -> str | None:
     return values.get("PRETTY_NAME") or values.get("NAME") or None
 
 
+def _network_stats_from_entries(
+    entries: list[tuple[str, int, int]], source: str
+) -> NetworkStats:
+    """Build network totals, preferring non-loopback interfaces."""
+
+    non_loopback = [entry for entry in entries if entry[0] != "lo"]
+    selected = non_loopback or entries
+    return NetworkStats(
+        rx_bytes=sum(entry[1] for entry in selected),
+        tx_bytes=sum(entry[2] for entry in selected),
+        interfaces=len(selected),
+        source=source,
+    )
+
+
 def parse_net_dev(text: str) -> NetworkStats:
     """Parse /proc/net/dev and total all interfaces except loopback."""
 
@@ -279,13 +338,121 @@ def parse_net_dev(text: str) -> NetworkStats:
 
     if not entries:
         raise MetricUnavailable("/proc/net/dev contains no interface rows")
-    non_loopback = [entry for entry in entries if entry[0] != "lo"]
-    selected = non_loopback or entries
+    return _network_stats_from_entries(entries, "/proc/net/dev")
+
+
+def parse_sysfs_net(net_root: Path) -> NetworkStats:
+    """Read interface counters from ``/sys/class/net``.
+
+    ``/proc/net/dev`` is restricted for unprivileged Android apps and in some
+    containers, while sysfs counters often remain readable.
+    """
+
+    try:
+        interfaces = sorted(net_root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise MetricUnavailable(f"cannot list {net_root}: {exc}") from exc
+
+    entries: list[tuple[str, int, int]] = []
+    for interface in interfaces:
+        statistics = interface / "statistics"
+        try:
+            rx_bytes = int(_read_text(statistics / "rx_bytes").strip())
+            tx_bytes = int(_read_text(statistics / "tx_bytes").strip())
+        except (OSError, ValueError):
+            continue
+        if rx_bytes < 0 or tx_bytes < 0:
+            continue
+        entries.append((interface.name, rx_bytes, tx_bytes))
+
+    if not entries:
+        raise MetricUnavailable(f"{net_root} contains no readable counters")
+    return _network_stats_from_entries(entries, "sysfs")
+
+
+def parse_ip_link_json(text: str) -> NetworkStats:
+    """Parse ``ip -s -j link`` output (iproute2 JSON)."""
+
+    try:
+        links = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricUnavailable("ip returned invalid JSON") from exc
+    if not isinstance(links, list):
+        raise MetricUnavailable("ip returned an unexpected JSON document")
+
+    entries: list[tuple[str, int, int]] = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        name = link.get("ifname")
+        stats = link.get("stats64") or link.get("stats")
+        if not isinstance(name, str) or not isinstance(stats, dict):
+            continue
+        rx_bytes = _ip_stat_bytes(stats, "rx")
+        tx_bytes = _ip_stat_bytes(stats, "tx")
+        if rx_bytes is None or tx_bytes is None:
+            continue
+        entries.append((name, rx_bytes, tx_bytes))
+
+    if not entries:
+        raise MetricUnavailable("ip reported no interface counters")
+    return _network_stats_from_entries(entries, "ip -s")
+
+
+def _ip_stat_bytes(stats: dict[str, object], direction: str) -> int | None:
+    section = stats.get(direction)
+    if not isinstance(section, dict):
+        return None
+    try:
+        value = int(section.get("bytes", -1))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def parse_android_netstats(text: str) -> NetworkStats:
+    """Parse the parcel printed by ``service call netstats 13``.
+
+    Android denies unprivileged apps access to ``/proc/net/dev`` and sysfs
+    network counters, but its ``netstats`` binder service exposes device-wide
+    totals. ``service`` prints the reply as a hex parcel.
+    """
+
+    words: list[int] = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        _, raw = line.split(":", 1)
+        data = raw.split("'", 1)[0]
+        words.extend(
+            int(token, 16) for token in re.findall(r"\b[0-9a-fA-F]{8}\b", data)
+        )
+
+    if not words:
+        raise MetricUnavailable("netstats returned no parcel data")
+
+    exception = words[0]
+    if exception:
+        signed = exception - 2**32 if exception >= 2**31 else exception
+        raise MetricUnavailable(f"netstats returned exception {signed}")
+
+    # AIDL writes a presence flag for the nullable StatsResult, followed by the
+    # parcelable's size (36 bytes) and four longs.
+    if len(words) >= 4 and words[1] == 1:
+        size_index = 2
+    else:
+        size_index = 1
+    if len(words) < size_index + 9 or words[size_index] != 36:
+        raise MetricUnavailable("netstats returned an unsupported response")
+
+    values = words[size_index + 1 : size_index + 9]
+    rx_bytes = values[0] | (values[1] << 32)
+    tx_bytes = values[4] | (values[5] << 32)
     return NetworkStats(
-        rx_bytes=sum(entry[1] for entry in selected),
-        tx_bytes=sum(entry[2] for entry in selected),
-        interfaces=len(selected),
-        source="/proc/net/dev",
+        rx_bytes=rx_bytes,
+        tx_bytes=tx_bytes,
+        interfaces=0,
+        source="android netstats",
     )
 
 
@@ -346,6 +513,8 @@ class SystemCollector:
         paths: Sequence[str | Path] = ("/",),
         *,
         proc_root: Path = Path("/proc"),
+        sysfs_net: Path = Path("/sys/class/net"),
+        android_service: Path = Path("/system/bin/service"),
         os_release: Path = Path("/etc/os-release"),
         cpu_sample_seconds: float = 0.12,
         command_timeout: float = 2.0,
@@ -356,6 +525,8 @@ class SystemCollector:
     ) -> None:
         self.paths = tuple(Path(path) for path in paths) or (Path("/"),)
         self.proc_root = Path(proc_root)
+        self.sysfs_net = Path(sysfs_net)
+        self.android_service = Path(android_service)
         self.os_release = Path(os_release)
         self.cpu_sample_seconds = max(0.0, cpu_sample_seconds)
         self.command_timeout = command_timeout
@@ -363,7 +534,7 @@ class SystemCollector:
         self.clock = clock
         self.sleep = sleep
         self.monotonic = monotonic
-        self._last_network: tuple[float, int, int] | None = None
+        self._last_network: tuple[float, int, int, str] | None = None
 
     def collect(self, detailed: bool = False) -> Snapshot:
         warnings: list[str] = []
@@ -440,26 +611,84 @@ class SystemCollector:
         return LoadAverage(one=one, five=five, fifteen=fifteen), "os.getloadavg"
 
     def _sample_cpu_usage(self) -> tuple[float | None, str | None]:
-        """Sample CPU usage, falling back to the average since boot.
+        """Sample CPU usage, falling back to process CPU-time deltas.
 
         Some containers (notably PRoot on Android) expose a static
-        ``/proc/stat``. In that case delta sampling produces no delta and the
-        since-boot average is the best read-only estimate available.
+        ``/proc/stat``. In that case per-process ``utime``/``stime`` counters
+        still advance, so their delta is used before falling back to the
+        average since boot.
         """
 
         if self.cpu_sample_seconds <= 0:
             return None, None
         stat_path = self.proc_root / "stat"
-        before = parse_cpu_stat(_read_text(stat_path))
+        stat_error: Exception | None = None
+        before: CpuTimes | None = None
+        try:
+            before = parse_cpu_stat(_read_text(stat_path))
+        except (OSError, ValueError, MetricUnavailable) as exc:
+            stat_error = exc
+
+        process_before = self._read_process_cpu_ticks()
+        started = self.monotonic()
         self.sleep(self.cpu_sample_seconds)
-        after = parse_cpu_stat(_read_text(stat_path))
-        usage = calculate_cpu_usage(before, after)
+        elapsed = self.monotonic() - started
+
+        after: CpuTimes | None = None
+        if before is not None:
+            try:
+                after = parse_cpu_stat(_read_text(stat_path))
+            except (OSError, ValueError, MetricUnavailable) as exc:
+                stat_error = exc
+
+        if before is not None and after is not None:
+            usage = calculate_cpu_usage(before, after)
+            if usage is not None:
+                return usage, "/proc/stat"
+
+        process_after = self._read_process_cpu_ticks()
+        usage = calculate_process_cpu_usage(
+            process_before,
+            process_after,
+            elapsed,
+            os.cpu_count(),
+            _clock_ticks(),
+        )
         if usage is not None:
-            return usage, "/proc/stat"
-        since_boot = calculate_cpu_usage_since_boot(after)
-        if since_boot is not None:
-            return since_boot, "/proc/stat (boot avg)"
+            return usage, "/proc/[pid]/stat"
+
+        if after is not None:
+            since_boot = calculate_cpu_usage_since_boot(after)
+            if since_boot is not None:
+                return since_boot, "/proc/stat (boot avg)"
+
+        if stat_error is not None:
+            raise MetricUnavailable(f"/proc/stat unavailable ({stat_error})")
         return None, None
+
+    def _read_process_cpu_ticks(self) -> dict[int, int] | None:
+        """Sum utime+stime for every readable process, keyed by PID."""
+
+        try:
+            entries = list(self.proc_root.iterdir())
+        except OSError:
+            return None
+
+        ticks: dict[int, int] = {}
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = _read_text(entry / "stat")
+                # The command name can contain spaces and parentheses, so split
+                # only after its closing parenthesis.
+                fields = stat.rsplit(")", 1)[1].split()
+                utime = int(fields[11])
+                stime = int(fields[12])
+            except (OSError, ValueError, IndexError):
+                continue
+            ticks[int(entry.name)] = utime + stime
+        return ticks or None
 
     def _collect_memory(self, warnings: list[str]) -> MemoryStats | None:
         try:
@@ -522,26 +751,57 @@ class SystemCollector:
             return None
 
     def _collect_network(self, warnings: list[str]) -> NetworkStats | None:
+        errors: list[str] = []
+        stats: NetworkStats | None = None
+
         try:
             stats = parse_net_dev(_read_text(self.proc_root / "net" / "dev"))
         except (OSError, ValueError, MetricUnavailable) as exc:
-            warnings.append(f"Network: {exc}")
+            errors.append(f"/proc/net/dev unavailable ({exc})")
+
+        if stats is None:
+            try:
+                stats = parse_sysfs_net(self.sysfs_net)
+            except (OSError, ValueError, MetricUnavailable) as exc:
+                errors.append(f"sysfs unavailable ({exc})")
+
+        if stats is None and self.android_service.exists():
+            try:
+                stats = parse_android_netstats(
+                    self._run(
+                        (str(self.android_service), "call", "netstats", "13")
+                    )
+                )
+            except MetricUnavailable as exc:
+                errors.append(f"android netstats unavailable ({exc})")
+
+        if stats is None:
+            try:
+                stats = parse_ip_link_json(self._run(("ip", "-s", "-j", "link")))
+            except MetricUnavailable as exc:
+                errors.append(str(exc))
+
+        if stats is None:
+            warnings.append("Network: " + "; ".join(errors))
             return None
 
         now = self.monotonic()
         rx_rate: float | None = None
         tx_rate: float | None = None
         if self._last_network is not None:
-            previous_time, previous_rx, previous_tx = self._last_network
+            previous_time, previous_rx, previous_tx, previous_source = (
+                self._last_network
+            )
             elapsed = now - previous_time
             if (
-                elapsed > 0
+                previous_source == stats.source
+                and elapsed > 0
                 and stats.rx_bytes >= previous_rx
                 and stats.tx_bytes >= previous_tx
             ):
                 rx_rate = (stats.rx_bytes - previous_rx) / elapsed
                 tx_rate = (stats.tx_bytes - previous_tx) / elapsed
-        self._last_network = (now, stats.rx_bytes, stats.tx_bytes)
+        self._last_network = (now, stats.rx_bytes, stats.tx_bytes, stats.source)
 
         return NetworkStats(
             rx_bytes=stats.rx_bytes,

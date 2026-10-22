@@ -13,15 +13,19 @@ from sysmon.collectors import (
     SystemCollector,
     calculate_cpu_usage,
     calculate_cpu_usage_since_boot,
+    calculate_process_cpu_usage,
+    parse_android_netstats,
     parse_boot_time,
     parse_cpu_stat,
     parse_df_k,
     parse_free_bytes,
+    parse_ip_link_json,
     parse_loadavg,
     parse_meminfo,
     parse_net_dev,
     parse_os_release,
     parse_ps_processes,
+    parse_sysfs_net,
     parse_uptime,
 )
 
@@ -65,6 +69,21 @@ PS_OUTPUT = """\
   999 100.0   1000 ps
 """
 
+IP_LINK_JSON = """\
+[
+  {"ifname": "lo", "stats64": {"rx": {"bytes": 1000}, "tx": {"bytes": 1000}}},
+  {"ifname": "eth0", "stats64": {"rx": {"bytes": 5000}, "tx": {"bytes": 2500}}},
+  {"ifname": "wlan0", "stats": {"rx": {"bytes": 3000}, "tx": {"bytes": 1500}}}
+]
+"""
+
+ANDROID_NETSTATS = """\
+Result: Parcel(
+0x00000000: 00000000 00000001 00000024 5e12641b '........$....d.^'
+0x00000010: 00000000 0016262b 00000000 0f6e01d1 '....+&........n.'
+0x00000020: 00000000 000a49a6 00000000          '.....I......    ')
+"""
+
 
 def add_proc_process(
     proc: Path,
@@ -82,6 +101,14 @@ def add_proc_process(
         f"100 {resident_pages} 10 0 0 0 0\n"
     )
     (process_dir / "comm").write_text(f"{command}\n")
+
+
+def write_proc_cpu_times(proc: Path, pid: int, utime: int, stime: int) -> None:
+    process_dir = proc / str(pid)
+    process_dir.mkdir(exist_ok=True)
+    (process_dir / "stat").write_text(
+        f"{pid} (worker) R 1 2 3 4 5 6 7 8 9 10 {utime} {stime} 0 0 0\n"
+    )
 
 
 def test_parse_loadavg() -> None:
@@ -192,6 +219,74 @@ def test_parse_net_dev_falls_back_to_loopback() -> None:
     assert network.rx_bytes == 1000
     assert network.tx_bytes == 1000
     assert network.interfaces == 1
+
+
+def test_parse_sysfs_net_excludes_loopback(tmp_path: Path) -> None:
+    interfaces = (("lo", 1000, 1000), ("eth0", 5000, 2500), ("wlan0", 3000, 1500))
+    for name, rx, tx in interfaces:
+        statistics = tmp_path / name / "statistics"
+        statistics.mkdir(parents=True)
+        (statistics / "rx_bytes").write_text(f"{rx}\n")
+        (statistics / "tx_bytes").write_text(f"{tx}\n")
+
+    network = parse_sysfs_net(tmp_path)
+    assert network.rx_bytes == 8000
+    assert network.tx_bytes == 4000
+    assert network.interfaces == 2
+    assert network.source == "sysfs"
+
+
+def test_parse_sysfs_net_falls_back_to_loopback(tmp_path: Path) -> None:
+    statistics = tmp_path / "lo" / "statistics"
+    statistics.mkdir(parents=True)
+    (statistics / "rx_bytes").write_text("42\n")
+    (statistics / "tx_bytes").write_text("24\n")
+
+    network = parse_sysfs_net(tmp_path)
+    assert (network.rx_bytes, network.tx_bytes, network.interfaces) == (42, 24, 1)
+
+
+def test_parse_sysfs_net_rejects_missing_or_empty_directory(tmp_path: Path) -> None:
+    with pytest.raises(MetricUnavailable):
+        parse_sysfs_net(tmp_path / "missing")
+    with pytest.raises(MetricUnavailable):
+        parse_sysfs_net(tmp_path)
+
+
+def test_parse_ip_link_json() -> None:
+    network = parse_ip_link_json(IP_LINK_JSON)
+    assert network.rx_bytes == 8000
+    assert network.tx_bytes == 4000
+    assert network.interfaces == 2
+    assert network.source == "ip -s"
+
+
+def test_parse_ip_link_json_rejects_bad_output() -> None:
+    with pytest.raises(MetricUnavailable):
+        parse_ip_link_json("not json")
+    with pytest.raises(MetricUnavailable):
+        parse_ip_link_json('[{"ifname": "eth0"}]')
+
+
+def test_parse_android_netstats() -> None:
+    network = parse_android_netstats(ANDROID_NETSTATS)
+    assert network.rx_bytes == 0x5E12641B
+    assert network.tx_bytes == 0x0F6E01D1
+    assert network.interfaces == 0
+    assert network.source == "android netstats"
+
+
+def test_parse_android_netstats_errors() -> None:
+    with pytest.raises(MetricUnavailable):
+        parse_android_netstats("")
+    with pytest.raises(MetricUnavailable, match="exception -1"):
+        parse_android_netstats(
+            "0x00000000: ffffffff 00000001 00000024 00000000 '........$.......'\n"
+        )
+    with pytest.raises(MetricUnavailable, match="unsupported"):
+        parse_android_netstats(
+            "0x00000000: 00000000 00000001 00000010 00000000 '................'\n"
+        )
 
 
 def test_parse_ps_processes_sorts_and_limits() -> None:
@@ -309,6 +404,73 @@ def test_static_proc_stat_falls_back_to_since_boot(tmp_path: Path) -> None:
     assert source == "/proc/stat (boot avg)"
 
 
+def test_process_cpu_usage_calculation() -> None:
+    assert calculate_process_cpu_usage(
+        {1: 100, 2: 50, 3: 10},
+        {1: 300, 2: 50, 4: 999},
+        elapsed=2.0,
+        cores=4,
+        clock_ticks=100,
+    ) == pytest.approx(25.0)
+    assert (
+        calculate_process_cpu_usage(
+            {1: 100}, {2: 200}, elapsed=2.0, cores=4, clock_ticks=100
+        )
+        is None
+    )
+    assert (
+        calculate_process_cpu_usage(
+            {1: 100}, {1: 300}, elapsed=0.0, cores=4, clock_ticks=100
+        )
+        is None
+    )
+
+
+def test_static_proc_stat_falls_back_to_process_cpu_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "stat").write_text("cpu  200 0 100 1100 0 0 0 0 0 0\n")
+    write_proc_cpu_times(tmp_path, 100, utime=10, stime=5)
+    write_proc_cpu_times(tmp_path, 200, utime=20, stime=5)
+
+    def advance(seconds: float) -> None:
+        write_proc_cpu_times(tmp_path, 100, utime=210, stime=5)
+        write_proc_cpu_times(tmp_path, 200, utime=20, stime=5)
+
+    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 4)
+    times = iter([100.0, 102.0])
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0.01,
+        sleep=advance,
+        monotonic=lambda: next(times),
+    )
+    usage, source = collector._sample_cpu_usage()
+    assert usage == pytest.approx(25.0)
+    assert source == "/proc/[pid]/stat"
+
+
+def test_process_cpu_fallback_when_proc_stat_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_proc_cpu_times(tmp_path, 100, utime=0, stime=0)
+
+    def advance(seconds: float) -> None:
+        write_proc_cpu_times(tmp_path, 100, utime=400, stime=0)
+
+    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 2)
+    times = iter([100.0, 102.0])
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0.01,
+        sleep=advance,
+        monotonic=lambda: next(times),
+    )
+    usage, source = collector._sample_cpu_usage()
+    assert usage == pytest.approx(100.0)
+    assert source == "/proc/[pid]/stat"
+
+
 def test_process_counts_and_proc_fallback_top(tmp_path: Path) -> None:
     add_proc_process(tmp_path, 1, "R", "init", resident_pages=10)
     add_proc_process(tmp_path, 2, "S", "bash", resident_pages=30)
@@ -374,6 +536,133 @@ def test_network_rates_use_collector_state(tmp_path: Path) -> None:
     assert second.tx_rate == 100.0
     assert second.rx_bytes == 4000
     assert second.tx_bytes == 1500
+
+
+def test_network_rates_reset_when_source_changes(tmp_path: Path) -> None:
+    net_dir = tmp_path / "proc" / "net"
+    net_dir.mkdir(parents=True)
+    (net_dir / "dev").write_text(NET_DEV)
+
+    sysfs = tmp_path / "sys"
+    statistics = sysfs / "wlan0" / "statistics"
+    statistics.mkdir(parents=True)
+    (statistics / "rx_bytes").write_text("100000\n")
+    (statistics / "tx_bytes").write_text("200000\n")
+
+    times = iter([100.0, 110.0, 120.0])
+    collector = SystemCollector(
+        proc_root=tmp_path / "proc",
+        sysfs_net=sysfs,
+        android_service=tmp_path / "no-service",
+        cpu_sample_seconds=0,
+        monotonic=lambda: next(times),
+    )
+    warnings: list[str] = []
+
+    first = collector._collect_network(warnings)
+    assert first is not None
+    assert first.source == "/proc/net/dev"
+
+    (net_dir / "dev").unlink()
+    second = collector._collect_network(warnings)
+    assert second is not None
+    assert second.source == "sysfs"
+    assert second.rx_bytes == 100000
+    assert second.rx_rate is None
+    assert second.tx_rate is None
+
+    (statistics / "rx_bytes").write_text("110000\n")
+    (statistics / "tx_bytes").write_text("220000\n")
+    third = collector._collect_network(warnings)
+    assert third is not None
+    assert third.rx_rate == 1000.0
+    assert third.tx_rate == 2000.0
+    assert warnings == []
+
+
+def test_network_falls_back_to_android_netstats(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    service = tmp_path / "service"
+    service.write_text("")
+
+    def parcel(rx: int, tx: int) -> str:
+        return "\n".join(
+            [
+                "Result: Parcel(",
+                f"0x00000000: 00000000 00000001 00000024 {rx & 0xFFFFFFFF:08x} '....'",
+                f"0x00000010: {rx >> 32:08x} 00000000 00000000 {tx & 0xFFFFFFFF:08x} '....'",
+                f"0x00000020: {tx >> 32:08x} 00000000 00000000 00000000 '....'",
+                ")",
+            ]
+        )
+
+    outputs = iter(
+        [
+            parcel(1000, 500),
+            parcel(4000, 1500),
+        ]
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args: tuple[str, ...]) -> str:
+        calls.append(args)
+        assert args[0] == str(service)
+        return next(outputs)
+
+    times = iter([100.0, 110.0])
+    collector = SystemCollector(
+        paths=(tmp_path,),
+        proc_root=proc,
+        sysfs_net=tmp_path / "no-sysfs",
+        android_service=service,
+        runner=runner,
+        cpu_sample_seconds=0,
+        monotonic=lambda: next(times),
+    )
+    warnings: list[str] = []
+
+    first = collector._collect_network(warnings)
+    second = collector._collect_network(warnings)
+
+    assert warnings == []
+    assert first is not None and second is not None
+    assert first.source == "android netstats"
+    assert first.rx_rate is None
+    assert second.rx_bytes == 4000
+    assert second.tx_bytes == 1500
+    assert second.rx_rate == 300.0
+    assert second.tx_rate == 100.0
+    assert calls == [
+        (str(service), "call", "netstats", "13"),
+        (str(service), "call", "netstats", "13"),
+    ]
+
+
+def test_network_reports_all_sources_when_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+
+    def runner(args: tuple[str, ...]) -> str:
+        raise RuntimeError("not supported")
+
+    collector = SystemCollector(
+        paths=(tmp_path,),
+        proc_root=proc,
+        sysfs_net=tmp_path / "no-sysfs",
+        android_service=tmp_path / "no-service",
+        runner=runner,
+        cpu_sample_seconds=0,
+        monotonic=lambda: 100.0,
+    )
+    warnings: list[str] = []
+    assert collector._collect_network(warnings) is None
+    assert len(warnings) == 1
+    assert "/proc/net/dev unavailable" in warnings[0]
+    assert "sysfs unavailable" in warnings[0]
+    assert "ip" in warnings[0]
 
 
 def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
