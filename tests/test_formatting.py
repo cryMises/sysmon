@@ -7,9 +7,11 @@ import pytest
 from sysmon.formatting import (
     format_bytes,
     format_duration,
+    format_frequency,
     format_load,
     format_percent,
     format_rate,
+    format_sparkline,
 )
 
 
@@ -62,3 +64,38 @@ def test_format_rate() -> None:
     assert format_rate(0) == "0 B/s"
     assert format_rate(1536) == "1.5 KiB/s"
     assert format_rate(2 * 1024**2) == "2.0 MiB/s"
+
+
+@pytest.mark.parametrize(
+    ("khz", "expected"),
+    [
+        (None, "n/a"),
+        (-1, "n/a"),
+        (0, "0 kHz"),
+        (480_000, "480 MHz"),
+        (1_000_000, "1.00 GHz"),
+        (1_800_000, "1.80 GHz"),
+        (3_350_000, "3.35 GHz"),
+    ],
+)
+def test_format_frequency(khz: int | None, expected: str) -> None:
+    assert format_frequency(khz) == expected
+
+
+def test_format_sparkline_scales_and_right_aligns() -> None:
+    assert format_sparkline([0, 50, 100], 3, maximum=100) == "▁▅█"
+    assert format_sparkline([100], 3, maximum=100) == "  █"
+    assert format_sparkline([None, 100], 4, maximum=100) == "   █"
+    assert format_sparkline([0, 100], 2, maximum=100) == "▁█"
+
+
+def test_format_sparkline_supports_ascii_and_missing_data() -> None:
+    assert format_sparkline([0, 100], 2, maximum=100, ascii_bars=True) == ".@"
+    assert format_sparkline([], 4) == "    "
+    assert format_sparkline([None, None], 4) == "    "
+    assert format_sparkline([10, 20], 0) == ""
+    assert format_sparkline([10, 20], 4, maximum=0) == "  ██"
+
+
+def test_format_sparkline_dynamic_maximum() -> None:
+    assert format_sparkline([1, 2, 3], 3) == "▃▆█"

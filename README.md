@@ -1,28 +1,32 @@
 # sysmon
 
-A small, read-only Linux system monitor for **Ubuntu running inside Termux** (including `proot-distro`). It renders CPU load, memory/swap usage, disk usage, uptime, and battery status as a [Rich](https://github.com/Textualize/rich) terminal dashboard.
+A small, read-only Linux system monitor for **Ubuntu running inside Termux** (including `proot-distro`). It renders CPU load and frequency, memory/swap usage, disk usage, uptime, and battery status as a [Rich](https://github.com/Textualize/rich) terminal dashboard.
 
 No root permissions, no writes, and no system settings are touched.
 
 ## Features
 
-- CPU load averages (1/5/15 min), CPU usage, and core count.
+- CPU load averages (1/5/15 min), CPU usage, core count, and per-cluster frequencies from `cpufreq` sysfs.
 - Container-aware CPU and memory limits when cgroup v2 is readable.
 - RAM and swap usage with bars and human-readable sizes.
 - Disk usage for one or more paths.
 - Uptime and boot time, extrapolated when `/proc/uptime` is frozen.
-- Battery level, charging state, temperature, health, and technology via `termux-battery-status` when available.
+- Battery level, charging state, temperature, health, technology, power draw, estimated time remaining, and cache age via `termux-battery-status` when available.
 - One-shot dashboard or live-refreshing watch mode.
 - Watch mode adds live-only details:
-  - Network RX/TX totals and throughput rates.
+  - Network RX/TX totals, throughput rates, and a per-interface breakdown.
   - Live CPU usage even when `/proc/stat` is frozen (via per-process CPU time).
-  - Running/total process counts.
-  - Top processes by live CPU time, with a `/proc` memory and `ps` fallback.
+  - Running/total process counts, plus configurable top-N, sort order, and command filter.
+  - In-memory trend strips (sparklines) for CPU, memory, RX/TX, and battery.
+  - Threshold alerts for CPU, memory, disk, and battery.
   - Sample counter, session duration, and refresh status.
 - JSON output for scripting, including network, process, and battery details.
+- JSON Lines streaming: `--json --watch` prints one compact JSON object per refresh.
+- Optional JSON config file for paths, interval, process settings, trends, and alert thresholds.
 - Graceful degradation: missing `/proc` entries or external utilities produce a warning panel, not a traceback.
 - Responsive layout: side-by-side panels on wide terminals, stacked on narrow Termux screens.
-- ASCII bar mode and `--no-color` for limited terminals.
+- ASCII bar/sparkline mode and `--no-color` for limited terminals.
+- Continuous integration: ruff lint, strict mypy, and pytest with coverage on Python 3.10–3.14.
 
 ## Requirements
 
@@ -88,31 +92,99 @@ python -m sysmon --json
 python -m sysmon --json | python -m json.tool
 ```
 
+JSON Lines (one object per refresh, useful for logging):
+
+```bash
+python -m sysmon --watch --json --count 10 | jq -c '.cpu.usage_percent'
+```
+
 If installed with `pip install -e .`, replace `python -m sysmon` with `sysmon`.
 
 ### Options
 
 | Option | Description |
 | --- | --- |
-| `-w`, `--watch` | Refresh until `Ctrl+C`, with network, process, and session details. Default is one snapshot. |
+| `-w`, `--watch` | Refresh until `Ctrl+C`, with network, process, trend, and session details. Default is one snapshot. |
 | `--once` | Explicitly print one snapshot and exit. |
 | `-i`, `--interval SECONDS` | Watch refresh interval, minimum `0.5` (default `2.0`). |
 | `-p`, `--path PATH` | Filesystem path to report. Repeat for multiple paths. Default `/`. |
-| `--json` | Print raw data as JSON, including network, process, and battery details. Cannot be combined with `--watch`. |
+| `--config PATH` | Load settings from a JSON config file. Command-line options win over it. |
+| `--top N` | Number of processes to show, `1`–`50` (default `5`). |
+| `--sort {cpu,mem,pid}` | Process sort order (default `cpu`). |
+| `--filter REGEX` | Only show processes whose command matches this regular expression. |
+| `--full-command` | Show the full command line instead of only the process name. |
+| `--json` | Print raw data as JSON. With `--watch`, emit JSON Lines instead of the dashboard. |
 | `--no-battery` | Skip the `termux-battery-status` query. |
-| `--ascii` | Use `#`/`-` bars instead of Unicode blocks. |
+| `--no-trends` | Disable the in-memory watch-mode trend strips. |
+| `--trend-samples N` | Number of trend samples to retain, `2`–`1000` (default `60`). |
+| `--count N` | Stop watch/JSON Lines after `N` samples. |
+| `--ascii` | Use `#`/`-` bars and `.`–`@` sparklines instead of Unicode blocks. |
 | `--no-color` | Disable colors. |
 | `--version` | Print the version. |
 
-When `--watch` is used without an interactive terminal, sysmon prints one snapshot and exits instead of looping. This keeps logs and pipes predictable.
+When `--watch` is used without an interactive terminal, sysmon prints one snapshot and exits instead of looping. This keeps logs and pipes predictable. `--json --watch` is the exception: it always streams JSON Lines, because that mode exists to be piped.
+
+### Configuration file
+
+`--config PATH` loads a small JSON file. Every key is optional; command-line options override the file, and anything left unset uses the defaults.
+
+```json
+{
+  "interval": 2.0,
+  "paths": ["/", "/data"],
+  "battery": true,
+  "processes": {
+    "limit": 5,
+    "sort": "cpu",
+    "filter": null,
+    "full_command": false
+  },
+  "trends": {
+    "enabled": true,
+    "samples": 60
+  },
+  "thresholds": {
+    "cpu": { "warning": 75, "critical": 90 },
+    "memory": { "warning": 80, "critical": 92 },
+    "disk": { "warning": 85, "critical": 95 },
+    "battery": { "warning": 30, "critical": 15 }
+  },
+  "ascii": false,
+  "no_color": false
+}
+```
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `interval` | number | `2.0` | Watch refresh interval, minimum `0.5`. |
+| `paths` | list of strings | `/` | Filesystem paths to report. |
+| `battery` | bool | `true` | Query `termux-battery-status`. |
+| `processes.limit` | int | `5` | `1`–`50`. |
+| `processes.sort` | string | `cpu` | `cpu`, `mem`, or `pid`. |
+| `processes.filter` | string or null | `null` | Regular expression matched against the command. |
+| `processes.full_command` | bool | `false` | Use `/proc/[pid]/cmdline` instead of `comm`. |
+| `trends.enabled` | bool | `true` | Show the watch-mode trend strips. |
+| `trends.samples` | int | `60` | `2`–`1000` retained samples. |
+| `thresholds.<metric>` | object | see above | `warning` and `critical` percentages, `0`–`100`. |
+| `ascii` | bool | `false` | ASCII bars and sparklines. |
+| `no_color` | bool | `false` | Disable colors. |
+
+Unknown keys, wrong types, out-of-range values, and invalid regular expressions are rejected with a clear error message instead of a traceback.
+
+### Thresholds and alerts
+
+Each metric has a `warning` and a `critical` percentage. CPU, memory, and disk alert when usage is **at or above** the threshold; battery alerts when the charge is **at or below** it (so battery thresholds are inverted, and `critical` must not exceed `warning`).
+
+When a metric crosses a threshold, the dashboard shows an `Alerts` panel above the other panels, and the corresponding meter changes colour (green → yellow → red). Thresholds are configured through the config file only; the JSON output always contains the raw measurements.
 
 ### Watch mode details
 
-`sysmon -w` refreshes the dashboard in an alternate screen and adds three live-only things (the Battery panel is separate and appears whenever its command is available):
+`sysmon -w` refreshes the dashboard in an alternate screen and adds four live-only things (the Battery panel is separate and appears whenever its command is available):
 
-1. **Network** — RX/TX totals plus bytes-per-second rates. Loopback is excluded when other interfaces are present. The first frame says `rate pending`; later frames use counter deltas. Sources are tried in order: `/proc/net/dev`, `/sys/class/net`, Android's `netstats` binder service (via `service call netstats 13`), then `ip -s -j link`.
-2. **Processes** — running/total counts from `/proc`, plus the five busiest processes. CPU percentages are computed from per-process `/proc/[pid]/stat` time deltas. If those counters are unavailable, sysmon falls back to `ps`; if that also fails, it shows the five largest resident-memory processes from `/proc` with CPU as `n/a`.
-3. **Session footer** — refresh interval, sample number, and how long the watch session has been running.
+1. **Network** — RX/TX totals plus bytes-per-second rates. Loopback is excluded when other interfaces are present. The first frame says `rate pending`; later frames use counter deltas. When per-interface counters are readable, the busiest interfaces are listed with their own RX/TX rates. Sources are tried in order: `/proc/net/dev`, `/sys/class/net`, Android's `netstats` binder service (via `service call netstats 13`), then `ip -s -j link`.
+2. **Processes** — running/total counts from `/proc`, plus the top processes (five by default). CPU percentages are computed from per-process `/proc/[pid]/stat` time deltas. If those counters are unavailable, sysmon falls back to `ps`; if that also fails, it shows the largest resident-memory processes from `/proc` with CPU as `n/a`. `--top`, `--sort`, `--filter`, and `--full-command` change what is listed; the counts always describe every process.
+3. **Trends** — an in-memory history (default 60 samples) rendered as sparklines for CPU, memory, RX/TX, and battery, each with the current value and the period maximum (minimum for battery). The history lives only in the running process and is never written to disk. `--no-trends` turns the panel off.
+4. **Session footer** — refresh interval, sample number, and how long the watch session has been running.
 
 The footer looks like:
 
@@ -120,50 +192,60 @@ The footer looks like:
 Ctrl+C to quit  ·  refresh 2s  ·  sample #12  ·  watching 24s
 ```
 
-When `termux-battery-status` is available, a Battery panel is shown in both one-shot and watch modes. It reports charge level, charging/plug state, temperature, health, and battery technology. Termux:API round trips can take a couple of seconds, so watch mode caches the result for 30 seconds; `--no-battery` skips the query entirely.
+When `termux-battery-status` is available, a Battery panel is shown in both one-shot and watch modes. It reports charge level, charging/plug state, temperature, health, and battery technology, plus an estimated power draw (voltage × current) and the time remaining while discharging. Termux:API round trips can take a couple of seconds, so watch mode caches the result for 30 seconds and shows how old the cached reading is; `--no-battery` skips the query entirely.
 
-On standard Linux, network accounting uses `/proc/net/dev`. Android denies unprivileged apps access to it, so sysmon falls back to the `netstats` binder service and can still show device-wide RX/TX totals and rates. If every source is blocked, sysmon shows `Network data unavailable` and a warning. Process details and session status still work. Process CPU uses `/proc` deltas in watch mode; values from the `ps` fallback are lifetime averages.
+On standard Linux, network accounting uses `/proc/net/dev`. Android denies unprivileged apps access to it, so sysmon falls back to the `netstats` binder service and can still show device-wide RX/TX totals and rates (without a per-interface breakdown, which Android does not expose to apps). If every source is blocked, sysmon shows `Network data unavailable` and a warning. Process details and session status still work. Process CPU uses `/proc` deltas in watch mode; values from the `ps` fallback are lifetime averages.
 
 ## Example output
 
 The layout below is from this workspace at 100 columns. In this PRoot environment `/proc/stat` counters are static, so CPU usage is derived from per-process CPU time and labelled accordingly. `/proc/net/dev` is blocked, so the Network panel uses Android's `netstats` service.
 
 ```text
-sysmon  system monitor                                                           2026-10-21 21:32:02
+sysmon  system monitor                                                           2026-10-22 11:59:08
 localhost · Ubuntu 26.04.1 LTS · aarch64
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ╭─ CPU ─────────────────────────────────────────╮ ╭─ Memory ───────────────────────────────────────╮
-│ load 1/5/15 0.12 / 0.07 / 0.02                │ │ RAM   ████████░░░░░░░░ 49.8%                   │
-│ usage       █░░░░░░░░░░░░░░░ 5.6%             │ │       5.5 GiB used / 11.1 GiB total            │
-│ cores       8                                 │ │ SWAP  ███████████░░░░░ 70.1%                   │
-╰─ src: /proc/loadavg + /proc/[pid]/stat ───────╯ │       5.6 GiB used / 8.0 GiB total             │
-                                                  ╰─ src: /proc/meminfo ───────────────────────────╯
+│ load 1/5/15 0.12 / 0.07 / 0.02                │ │ RAM   █████████░░░░░░░ 55.5%                   │
+│ usage       ███░░░░░░░░░░░░░ 19.6%            │ │       6.1 GiB used / 11.1 GiB total            │
+│ cores       8                                 │ │ SWAP  ████████░░░░░░░░ 51.1%                   │
+│ CPU 0-3     1.30 GHz / 2.20 GHz max           │ │       4.1 GiB used / 8.0 GiB total             │
+│ CPU 4-6     900 MHz / 3.20 GHz max            │ ╰─ src: /proc/meminfo ───────────────────────────╯
+│ CPU 7       400 MHz / 3.35 GHz max            │                                                    │
+╰─ src: /proc/loadavg + /proc/[pid]/stat ───────╯                                                    │
 ╭─ Disk ────────────────────────────────────────╮ ╭─ Uptime ───────────────────────────────────────╮
 │ /                                             │ │ 2m 4s                                          │
-│ █████░░░░░░░░░░░ 31.4%                        │ │ booted 2026-10-21 21:29                        │
-│ 146.0 GiB / 465.4 GiB used · 318.9 GiB free   │ ╰─ src: /proc/uptime ────────────────────────────╯
-╰─ src: statvfs ────────────────────────────────╯                                                   
+│ █████░░░░░░░░░░░ 31.6%                        │ │ booted 2026-10-22 11:57                        │
+│ 146.9 GiB / 465.4 GiB used · 318.0 GiB free   │ ╰─ src: /proc/uptime ────────────────────────────╯
+╰─ src: statvfs ────────────────────────────────╯                                                    │
 ╭─ Battery ────────────────────────────────────────────────────────────────────────────────────────╮
-│ ███████░░░░░░░░░ 45.0%  Discharging · Unplugged                                                  │
-│                         37.5°C · Good · Li-poly                                                  │
+│ █████████████░░░ 81.0%  Discharging · Unplugged                                                  │
+│                         38.7°C · Good · Li-poly                                                  │
+│                         2.30 W · ~6h 38m left                                                    │
 ╰─ src: termux-battery-status ─────────────────────────────────────────────────────────────────────╯
 Run with --watch for live updates  ·  --json for machine-readable output
 ```
 
 On a narrow terminal the panels stack vertically.
 
-In live mode, two more panels are added below the battery (when present):
+In live mode, three more panels are added below the battery (when present):
 
 ```text
-╭─ Network ─────────────────────────────────────╮ ╭─ Processes ────────────────────────────────────╮
-│ RX  5.0 GiB total   33.2 KiB/s                │ │ 2 running · 42 processes                       │
-│ TX  2.0 GiB total   8.3 KiB/s                 │ │    PID  COMMAND                CPU         MEM │
-│                                               │ │   1234  python               12.5%   512.0 MiB │
-╰─ src: android netstats ───────────────────────╯ │   5678  opencode              6.1%   322.0 MiB │
-                                                  │   9012  bash                  0.4%    64.0 MiB │
-                                                  │   3456  node                  0.2%   128.0 MiB │
-                                                  │   7890  sshd                  0.1%    12.0 MiB │
-                                                  ╰─ src: /proc ───────────────────────────────────╯
+╭─ Trends ───────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ CPU ▂▂▂ 18.7%  max 18.7%                                                                                   │
+│ RAM ▅▅▅ 54.7%  max 54.7%                                                                                   │
+│ RX   █▃ 250 B/s  peak 1.0 KiB/s                                                                            │
+│ TX   █▁ 0 B/s  peak 960 B/s                                                                                │
+│ BAT ▇▇▇ 81.0%  low 81.0%                                                                                   │
+╰─ src: in-memory history ───────────────────────────────────────────────────────────────────────────────────╯
+╭─ Network ──────────────────────────────────────────╮ ╭─ Processes ─────────────────────────────────────────╮
+│ RX  2.2 GiB total   250 B/s                        │ │ 3 running · 13 processes                            │
+│ TX  698.2 MiB total   0 B/s                        │ │    PID  COMMAND                     CPU         MEM │
+╰─ src: android netstats ────────────────────────────╯ │   5468  proot                     39.8%     4.3 MiB │
+                                                       │  26465  opencode                  35.8%   229.8 MiB │
+                                                       │   6306  opencode                  17.3%   314.5 MiB │
+                                                       │  16595  python                    10.6%    18.8 MiB │
+                                                       │  28945  com.termux                 4.0%   120.1 MiB │
+                                                       ╰─ src: /proc ────────────────────────────────────────╯
 Ctrl+C to quit  ·  refresh 2s  ·  sample #12  ·  watching 24s
 ```
 
@@ -177,11 +259,13 @@ sysmon is read-only. It prefers `/proc` and the Python standard library, then fa
 | --- | --- | --- | --- |
 | CPU load | `/proc/loadavg` | `os.getloadavg()` | `n/a` + warning |
 | CPU usage | cgroup v2 `cpu.stat` (containers) or `/proc/stat` delta | per-process `/proc/[pid]/stat` CPU-time delta, then `/proc/stat` average since boot | `n/a` + warning |
+| CPU frequency | `/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq` | none | panel row omitted (no warning) |
 | Memory / swap | cgroup v2 `memory.current`/`memory.max` when limited, else `/proc/meminfo` | `free -b` | `n/a` + warning |
 | Disk | `shutil.disk_usage` (`statvfs`) | `df -Pk PATH` | skipped path + warning |
 | Uptime | `/proc/uptime` (extrapolated if frozen) | `uptime -s` | `n/a` + warning |
 | Battery | `termux-battery-status` JSON | none | panel hidden; warning if the command fails |
 | Network (watch/JSON) | `/proc/net/dev` | `/sys/class/net`, Android `netstats`, `ip -s -j link` | `n/a` + warning |
+| Per-interface network | `/proc/net/dev` | `/sys/class/net`, `ip -s -j link` | device-wide totals only (Android) |
 | Process counts (watch/JSON) | `/proc/[pid]/stat` | none | `n/a` |
 | Top processes (watch/JSON) | `/proc/[pid]/stat` CPU delta | `ps -eo pid=,pcpu=,rss=,comm=`, then `/proc/[pid]/statm` sorted by RSS | panel unavailable |
 
@@ -193,6 +277,8 @@ External commands:
 - Never block the app from starting when missing.
 
 CPU usage takes a short sample (`0.12s`). A readable cgroup v2 `cpu.stat` is preferred so containers report their own CPU time; otherwise sysmon uses the `/proc/stat` delta. If those counters are frozen, as they can be under PRoot/Android, usage is computed from per-process CPU-time deltas and labelled accordingly. Only if those counters are also unavailable does it show the average since boot. A frozen `/proc/uptime` is advanced with monotonic elapsed time and labelled `(extrapolated)`, so uptime and boot time keep moving. Network totals prefer `/proc/net/dev` and fall back to sysfs, Android's `netstats` binder service, or `ip -s -j link`, so the panel can still work when Android blocks procfs. Process statistics remain independent of network access.
+
+CPU cluster rows come from the kernel's `cpufreq` policies. Each policy becomes one row with its affected CPU range, the current frequency, and the maximum frequency. Devices without `cpufreq` (many containers and virtual machines) simply show no extra rows, without a warning.
 
 Battery data comes from the JSON emitted by `termux-battery-status`. The command is optional and is skipped silently when it is not installed; a command failure or malformed response becomes a warning. Because Termux:API calls can be slow, results are cached for 30 seconds and the command has a 5-second timeout. Use `--no-battery` to skip the query.
 
@@ -210,6 +296,15 @@ Battery data comes from the JSON emitted by `termux-battery-status`. The command
     "load_15m": 0.02,
     "usage_percent": 5.6,
     "cores": 8,
+    "clusters": [
+      {
+        "label": "CPU 0-3",
+        "current_khz": 1400000,
+        "min_khz": 480000,
+        "max_khz": 2200000,
+        "source": "sysfs cpufreq"
+      }
+    ],
     "source": "/proc/loadavg + /proc/[pid]/stat"
   },
   "memory": {
@@ -237,8 +332,17 @@ Battery data comes from the JSON emitted by `termux-battery-status`. The command
     "tx_bytes": 2147483648,
     "rx_bytes_per_sec": null,
     "tx_bytes_per_sec": null,
-    "interfaces": 0,
-    "source": "android netstats"
+    "interfaces": 2,
+    "interface_details": [
+      {
+        "name": "wlan0",
+        "rx_bytes": 4294967296,
+        "tx_bytes": 1073741824,
+        "rx_bytes_per_sec": 1400.0,
+        "tx_bytes_per_sec": 400.0
+      }
+    ],
+    "source": "/proc/net/dev"
   },
   "processes": {
     "total": 42,
@@ -251,7 +355,10 @@ Battery data comes from the JSON emitted by `termux-battery-status`. The command
         "memory_bytes": 536870912
       }
     ],
-    "source": "/proc"
+    "source": "/proc",
+    "sort": "cpu",
+    "limit": 5,
+    "filter": null
   },
   "battery": {
     "present": true,
@@ -263,13 +370,18 @@ Battery data comes from the JSON emitted by `termux-battery-status`. The command
     "technology": "Li-poly",
     "voltage_mv": 3813,
     "current_ua": 801000,
+    "current_average_ua": -3000,
+    "charge_counter_uah": 2015000,
+    "power_w": 3.1,
+    "time_remaining_seconds": 9056,
+    "cache_age_seconds": 0.0,
     "source": "termux-battery-status"
   },
   "warnings": []
 }
 ```
 
-Timestamps are local ISO 8601. Sizes are bytes; percentages are rounded to one decimal. The real output includes every field from the models (for example `available_bytes`, `free_bytes`, and swap fields). `--json` collects a detailed single sample, so throughput rates are `null` because there is no previous sample to diff against. `cores` can be fractional when a cgroup CPU quota is active. `battery` is `null` when `termux-battery-status` is unavailable or no battery is present.
+Timestamps are local ISO 8601. Sizes are bytes; percentages are rounded to one decimal. The real output includes every field from the models (for example `available_bytes`, `free_bytes`, and swap fields). `--json` collects a detailed single sample, so throughput rates are `null` because there is no previous sample to diff against. `cores` can be fractional when a cgroup CPU quota is active. `battery` is `null` when `termux-battery-status` is unavailable or no battery is present. `power_w` is `voltage × current` and `time_remaining_seconds` is only estimated while discharging.
 
 ## Tests
 
@@ -278,42 +390,57 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
+Lint, type check, and coverage:
+
+```bash
+ruff check .
+mypy
+pytest --cov=sysmon --cov-report=term-missing
+```
+
 The suite covers:
 
-- Byte/duration/percent/rate formatting.
+- Byte/duration/percent/rate/frequency formatting and sparkline rendering.
 - `/proc/loadavg`, `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net/dev`, `/sys/class/net`, `ip -s -j link`, Android `netstats`, cgroup v2 values, `ps`, `df -Pk`, `free -b`, and `os-release` parsing.
 - CPU delta, since-boot, and per-process CPU-time calculations.
 - Frozen-uptime extrapolation and cgroup CPU/memory limit handling.
-- Network rate calculations across samples and network source fallbacks.
-- Process counts, live per-process CPU ranking, and the `/proc` memory fallback.
-- Battery JSON parsing, percentage fallback, missing/failed command handling, and cache expiry.
+- cpufreq cluster reading, including missing sysfs and missing `scaling_cur_freq`.
+- Network rate calculations across samples, per-interface rates, and network source fallbacks.
+- Process counts, live per-process CPU ranking, sorting, filtering, full command lines, and the `/proc` memory fallback.
+- Battery JSON parsing, power and time estimates, percentage fallback, missing/failed command handling, and cache expiry.
+- Config file parsing, validation errors, and CLI/config precedence.
 - Command fallbacks with a fake runner.
 - Missing `/proc` files and missing utilities, asserting warnings instead of crashes.
-- Dashboard rendering at wide and narrow widths, battery/live panels, ASCII bars, and warning escapes.
-- CLI one-shot, JSON, option validation, path expansion, `--no-battery`, and non-TTY watch behavior.
+- Dashboard rendering at wide and narrow widths, battery/live/trend/alert panels, ASCII bars, and warning escapes.
+- CLI one-shot, JSON, JSON Lines, option validation, path expansion, config loading, `--no-battery`, `--no-trends`, and non-TTY watch behavior.
 
 Current result on Ubuntu 26.04 aarch64 / Python 3.14 / Rich 15:
 
 ```text
-........................................................................................
-88 passed
+157 passed
 ```
 
-Interactive watch was also exercised under a pseudo-terminal: it rendered multiple live frames with battery/network/process/session panels, handled `Ctrl+C`, printed `sysmon stopped.`, and exited with code 0.
+Coverage is 89% of statements (`pytest --cov=sysmon`).
+
+Interactive watch was also exercised under a pseudo-terminal: it rendered multiple live frames with battery/network/process/trend panels, handled `Ctrl+C`, printed `sysmon stopped.`, and exited with code 0.
+
+Continuous integration runs the same commands (`ruff check .`, `mypy`, `pytest --cov=sysmon`) on Python 3.10, 3.11, 3.12, 3.13, and 3.14 via GitHub Actions (`.github/workflows/ci.yml`).
 
 ## Project layout
 
 ```text
 sysmon/
 ├── __main__.py      # python -m sysmon
-├── cli.py           # argument parsing, one-shot/watch/JSON modes
+├── cli.py           # argument parsing, config merging, one-shot/watch/JSON modes
 ├── collectors.py     # /proc parsers, fallbacks, read-only collection
-├── dashboard.py      # Rich panels, meters, responsive layout
-├── formatting.py     # byte/duration/percent helpers
+├── config.py         # optional JSON config file parsing and validation
+├── dashboard.py      # Rich panels, meters, sparklines, responsive layout
+├── formatting.py     # byte/duration/percent/frequency/sparkline helpers
 └── models.py         # immutable dataclasses + JSON conversion
 tests/
 ├── test_cli.py
 ├── test_collectors.py
+├── test_config.py
 ├── test_dashboard.py
 └── test_formatting.py
 ```
@@ -334,10 +461,10 @@ To add a metric:
 - **No root**: sysmon only reads files and calls read-only utilities. It does not change kernel settings, files, or services.
 - **Container values**: inside PRoot, `/proc` reflects the shared kernel/container view, not necessarily every Android host statistic. cgroup v2 CPU and memory limits are used when readable. Frozen `/proc/stat` counters are handled with per-process CPU-time deltas (then the boot average as a last resort), and a frozen `/proc/uptime` is extrapolated with monotonic time.
 - **Restricted storage**: Android scoped storage may block paths such as `/sdcard`. Point `--path` at an accessible directory; inaccessible paths appear as warnings.
-- **Restricted networking**: Android and some PRoot setups deny access to `/proc/net/dev` and `/sys/class/net`. sysmon then queries the `netstats` binder service via `service call netstats 13`; if that is blocked too, the Network panel shows unavailable and a warning.
-- **No history**: there are no charts or retained samples. Each refresh is independent; only network rates, process CPU, uptime extrapolation, and the battery cache use earlier data.
-- **Process scope**: watch mode shows counts and the top five processes, not a full process browser. CPU comes from `/proc` deltas; 100% means one core, so a multi-threaded process can exceed 100%. The `ps` fallback reports lifetime averages, and the final `/proc` fallback ranks by resident memory and leaves CPU as `n/a`.
-- **Battery scope**: the panel requires `termux-battery-status` from the `termux-api` package and the Termux:API app. It is hidden when the command is absent or the device reports no battery. The command can take a couple of seconds, so watch mode caches the last result for 30 seconds; use `--no-battery` to skip it entirely.
+- **Restricted networking**: Android and some PRoot setups deny access to `/proc/net/dev` and `/sys/class/net`. sysmon then queries the `netstats` binder service via `service call netstats 13`; if that is blocked too, the Network panel shows unavailable and a warning. Android only exposes device-wide totals, so the per-interface list is empty there.
+- **In-memory history only**: the trend strips are kept in RAM for the lifetime of the process. Nothing is written to disk, and one-shot mode has no history.
+- **Process scope**: watch mode shows counts and the top processes (five by default), not a full process browser. CPU comes from `/proc` deltas; 100% means one core, so a multi-threaded process can exceed 100%. The `ps` fallback reports lifetime averages, and the final `/proc` fallback ranks by resident memory and leaves CPU as `n/a`. `--filter` only hides rows; the running/total counts still cover every process.
+- **Battery scope**: the panel requires `termux-battery-status` from the `termux-api` package and the Termux:API app. It is hidden when the command is absent or the device reports no battery. The command can take a couple of seconds, so watch mode caches the last result for 30 seconds; use `--no-battery` to skip it entirely. Power draw and time remaining are estimates: the API exposes no full-charge counter, so time to full is never shown.
 - **Disk space semantics**: usage comes from `statvfs` when possible, so reserved blocks can make `used + free` differ slightly from `total`.
 - **Colors**: Rich disables color automatically when output is redirected. Use `--no-color` or `--ascii` on limited terminals.
 - **Sampling cost**: one snapshot blocks for about `0.12s` to measure CPU usage. Detailed watch/JSON collection also scans `/proc` for per-process CPU and runs network queries; Android `netstats` can add roughly `0.1-0.3s`. The battery query can add up to its 5-second timeout (typically around 2 seconds), though watch mode refreshes it only every 30 seconds. Watch mode enforces a minimum interval of `0.5s`.
@@ -346,11 +473,14 @@ To add a metric:
 
 - `ModuleNotFoundError: No module named 'rich'`: install `requirements.txt` with the same Python interpreter used to run sysmon (activate the venv first).
 - `ensurepip is not available` in Ubuntu: install `python3-venv` once, then recreate `.venv`.
+- `sysmon: error: unknown config key: ...`: the config file contains a key sysmon does not know. Remove it or fix the spelling; the file must be a JSON object.
+- `sysmon: error: thresholds.battery.critical must be less than or equal to warning`: battery thresholds are inverted — the warning level must be at or above the critical level.
 - CPU usage shows `n/a`: cgroup and `/proc/stat` counters are unreadable, and per-process CPU counters in `/proc/[pid]/stat` cannot be read either. CPU load can still be shown if `/proc/loadavg` or `os.getloadavg()` works.
+- No CPU frequency rows: the kernel exposes no `cpufreq` policies (common in containers and VMs). This is not an error and produces no warning.
 - Uptime source says `(extrapolated)`: `/proc/uptime` is frozen, which is common under PRoot. sysmon advances uptime from monotonic elapsed time so the panel and boot time stay consistent.
 - Network shows unavailable: `/proc/net/dev`, `/sys/class/net`, Android's `netstats` service, and `ip -s -j link` all failed. This can happen in locked-down Termux/proot setups; the rest of the dashboard still works. On Android, check that `/system/bin/service` is visible inside the container.
 - Processes show `n/a` for CPU: `/proc` CPU deltas and `ps` both failed, so top processes come from `/proc` memory usage.
 - Battery panel is missing: `termux-battery-status` is not installed/visible, or the device reports no battery. In Termux, run `pkg install termux-api` and install the Termux:API app; otherwise this is expected and no warning is shown.
 - Battery shows a warning: the command exists but Termux:API failed or returned malformed JSON. The panel stays hidden until the next successful query. Use `--no-battery` to skip the query.
 - Disk panel shows a warning: the path is not visible to the current user/container. Try `--path "$HOME"`.
-- Watch mode exits immediately: stdout is not a TTY. Run it directly in Termux, not through a pipe or log redirect.
+- Watch mode exits immediately: stdout is not a TTY. Run it directly in Termux, not through a pipe or log redirect — or use `--json --watch`, which streams JSON Lines instead.

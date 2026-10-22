@@ -8,10 +8,12 @@ import pytest
 
 from sysmon.models import (
     BatteryStats,
+    CpuClusterStats,
     CpuStats,
     DiskStats,
     LoadAverage,
     MemoryStats,
+    NetworkInterfaceStats,
     NetworkStats,
     ProcessInfo,
     ProcessStats,
@@ -30,6 +32,20 @@ def sample_snapshot() -> Snapshot:
             load=LoadAverage(one=1.25, five=0.75, fifteen=0.50),
             usage_percent=37.5,
             cores=8,
+            clusters=(
+                CpuClusterStats(
+                    label="CPU 0-3",
+                    current_khz=1_800_000,
+                    min_khz=400_000,
+                    max_khz=2_200_000,
+                ),
+                CpuClusterStats(
+                    label="CPU 4-7",
+                    current_khz=2_400_000,
+                    min_khz=600_000,
+                    max_khz=3_200_000,
+                ),
+            ),
             source="/proc/loadavg + /proc/stat",
         ),
         memory=MemoryStats(
@@ -66,6 +82,9 @@ def sample_snapshot() -> Snapshot:
             technology="Li-poly",
             voltage_mv=3813,
             current_ua=801000,
+            current_average_ua=-3000,
+            charge_counter_uah=2_015_000,
+            cache_age_seconds=0.0,
         ),
     )
 
@@ -80,6 +99,22 @@ def live_snapshot(sample_snapshot: Snapshot) -> Snapshot:
             rx_rate=1536.0,
             tx_rate=512.0,
             interfaces=2,
+            interface_details=(
+                NetworkInterfaceStats(
+                    name="rmnet0",
+                    rx_bytes=1 * GIB,
+                    tx_bytes=1 * GIB,
+                    rx_rate=136.0,
+                    tx_rate=112.0,
+                ),
+                NetworkInterfaceStats(
+                    name="wlan0",
+                    rx_bytes=4 * GIB,
+                    tx_bytes=1 * GIB,
+                    rx_rate=1400.0,
+                    tx_rate=400.0,
+                ),
+            ),
             source="/proc/net/dev",
         ),
         processes=ProcessStats(

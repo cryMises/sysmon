@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-import sysmon.collectors as collectors
 from sysmon.collectors import (
     CpuTimes,
     MetricUnavailable,
@@ -264,10 +265,15 @@ def test_parse_net_dev_excludes_loopback() -> None:
     assert network.interfaces == 1
     assert network.rx_rate is None
     assert network.source == "/proc/net/dev"
+    assert [interface.name for interface in network.interface_details] == ["wlan0"]
+    assert network.interface_details[0].rx_bytes == 2000
+    assert network.interface_details[0].tx_bytes == 500
+    assert network.interface_details[0].rx_rate is None
 
 
 def test_parse_net_dev_falls_back_to_loopback() -> None:
-    only_loopback = "\n".join(NET_DEV.splitlines()[:2] + [NET_DEV.splitlines()[2]])
+    lines = NET_DEV.splitlines()
+    only_loopback = "\n".join([*lines[:2], lines[2]])
     network = parse_net_dev(only_loopback)
     assert network.rx_bytes == 1000
     assert network.tx_bytes == 1000
@@ -287,6 +293,12 @@ def test_parse_sysfs_net_excludes_loopback(tmp_path: Path) -> None:
     assert network.tx_bytes == 4000
     assert network.interfaces == 2
     assert network.source == "sysfs"
+    assert [interface.name for interface in network.interface_details] == [
+        "eth0",
+        "wlan0",
+    ]
+    assert network.interface_details[0].rx_bytes == 5000
+    assert network.interface_details[1].tx_bytes == 1500
 
 
 def test_parse_sysfs_net_falls_back_to_loopback(tmp_path: Path) -> None:
@@ -312,6 +324,12 @@ def test_parse_ip_link_json() -> None:
     assert network.tx_bytes == 4000
     assert network.interfaces == 2
     assert network.source == "ip -s"
+    assert [interface.name for interface in network.interface_details] == [
+        "eth0",
+        "wlan0",
+    ]
+    assert network.interface_details[1].rx_bytes == 3000
+    assert network.interface_details[1].tx_bytes == 1500
 
 
 def test_parse_ip_link_json_rejects_bad_output() -> None:
@@ -326,6 +344,7 @@ def test_parse_android_netstats() -> None:
     assert network.rx_bytes == 0x5E12641B
     assert network.tx_bytes == 0x0F6E01D1
     assert network.interfaces == 0
+    assert network.interface_details == ()
     assert network.source == "android netstats"
 
 
@@ -357,6 +376,20 @@ def test_parse_ps_processes_rejects_empty_output() -> None:
         parse_ps_processes("PID CPU MEM COMMAND\n")
 
 
+def test_parse_ps_processes_supports_sort_and_filter() -> None:
+    by_memory = parse_ps_processes(PS_OUTPUT, limit=2, sort_by="mem")
+    assert [process.pid for process in by_memory] == [123, 456]
+
+    by_pid = parse_ps_processes(PS_OUTPUT, limit=2, sort_by="pid")
+    assert [process.pid for process in by_pid] == [123, 456]
+
+    filtered = parse_ps_processes(PS_OUTPUT, filter_pattern="python")
+    assert [process.pid for process in filtered] == [456]
+
+    no_matches = parse_ps_processes(PS_OUTPUT, filter_pattern="does-not-match")
+    assert no_matches == ()
+
+
 def test_parse_os_release() -> None:
     assert (
         parse_os_release('NAME="Ubuntu"\nPRETTY_NAME="Ubuntu 26.04.1 LTS"\n')
@@ -378,7 +411,40 @@ def test_parse_termux_battery() -> None:
     assert battery.technology == "Li-poly"
     assert battery.voltage_mv == 3813
     assert battery.current_ua == 801000
+    assert battery.current_average_ua == -3000
+    assert battery.charge_counter_uah == 2_015_000
+    assert battery.power_w == pytest.approx(3.054213)
+    assert battery.time_remaining_seconds == pytest.approx(9056.18, rel=1e-4)
     assert battery.source == "termux-battery-status"
+
+
+def test_battery_power_and_time_are_conditional() -> None:
+    charging = parse_termux_battery(
+        '{"present": true, "status": "CHARGING", "voltage": 4000, '
+        '"current": -1000000, "charge_counter": 2000000}'
+    )
+    assert charging.power_w == pytest.approx(4.0)
+    assert charging.time_remaining_seconds is None
+
+    no_voltage = parse_termux_battery(
+        '{"present": true, "status": "DISCHARGING", "current": 500000, '
+        '"charge_counter": 1000000}'
+    )
+    assert no_voltage.power_w is None
+    assert no_voltage.time_remaining_seconds == pytest.approx(7200.0)
+
+    no_charge = parse_termux_battery(
+        '{"present": true, "status": "DISCHARGING", "voltage": 4000, '
+        '"current": 500000}'
+    )
+    assert no_charge.time_remaining_seconds is None
+
+    average_only = parse_termux_battery(
+        '{"present": true, "status": "DISCHARGING", "voltage": 4000, '
+        '"current_average": 500000, "charge_counter": 1000000}'
+    )
+    assert average_only.power_w == pytest.approx(2.0)
+    assert average_only.time_remaining_seconds == pytest.approx(7200.0)
 
 
 def test_parse_termux_battery_percentage_fallback() -> None:
@@ -411,8 +477,8 @@ def test_parse_termux_battery_absent_and_invalid() -> None:
 def test_battery_collection_caches_termux_command(tmp_path: Path) -> None:
     calls: list[tuple[str, ...]] = []
 
-    def runner(args: tuple[str, ...]) -> str:
-        calls.append(args)
+    def runner(args: Sequence[str]) -> str:
+        calls.append(tuple(args))
         return BATTERY_JSON
 
     times = iter([100.0, 101.0, 131.0])
@@ -429,8 +495,11 @@ def test_battery_collection_caches_termux_command(tmp_path: Path) -> None:
     third = collector._collect_battery(warnings)
 
     assert first is not None and first.percentage == 45
-    assert second is first
+    assert first.cache_age_seconds == 0.0
+    assert second is not None and second.percentage == 45
+    assert second.cache_age_seconds == pytest.approx(1.0)
     assert third is not None and third.percentage == 45
+    assert third.cache_age_seconds == 0.0
     assert calls == [
         ("termux-battery-status",),
         ("termux-battery-status",),
@@ -441,7 +510,7 @@ def test_battery_collection_caches_termux_command(tmp_path: Path) -> None:
 def test_battery_missing_command_is_silent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(collectors.shutil, "which", lambda name: None)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
     collector = SystemCollector(proc_root=tmp_path, monotonic=lambda: 100.0)
     warnings: list[str] = []
 
@@ -464,8 +533,8 @@ def test_battery_absent_is_silent(tmp_path: Path) -> None:
 def test_battery_failure_is_cached(tmp_path: Path) -> None:
     calls: list[tuple[str, ...]] = []
 
-    def runner(args: tuple[str, ...]) -> str:
-        calls.append(args)
+    def runner(args: Sequence[str]) -> str:
+        calls.append(tuple(args))
         raise RuntimeError("Termux:API unavailable")
 
     times = iter([100.0, 101.0])
@@ -494,8 +563,8 @@ def test_collector_uses_command_fallbacks(tmp_path: Path) -> None:
 
     calls: list[tuple[str, ...]] = []
 
-    def runner(args: tuple[str, ...]) -> str:
-        calls.append(args)
+    def runner(args: Sequence[str]) -> str:
+        calls.append(tuple(args))
         if args[0] == "free":
             return FREE_BYTES
         raise AssertionError(f"unexpected command: {args}")
@@ -564,7 +633,7 @@ def test_collector_uses_cgroup_cpu_limit(
     def advance(seconds: float) -> None:
         (cgroup / "cpu.stat").write_text("usage_usec 4000000\n")
 
-    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
     times = iter([100.0, 102.0])
     collector = SystemCollector(
         proc_root=tmp_path / "proc",
@@ -616,10 +685,67 @@ def test_cgroup_path_uses_current_scope(tmp_path: Path) -> None:
     assert collector._cgroup_dir() == scoped
 
 
+def test_cpu_frequency_clusters_from_sysfs(tmp_path: Path) -> None:
+    freq_root = tmp_path / "cpufreq"
+    policies = {
+        "policy4": ("4 5 6 7", 1_600_000, 600_000, 3_200_000),
+        "policy0": ("0 1 2 3", 1_100_000, 400_000, 2_200_000),
+        "policy7": ("7", 400_000, None, 3_350_000),
+        "policy8": ("8", None, 400_000, 2_000_000),
+    }
+    for name, (cpus, current, minimum, maximum) in policies.items():
+        policy = freq_root / name
+        policy.mkdir(parents=True)
+        (policy / "affected_cpus").write_text(f"{cpus}\n")
+        if current is not None:
+            (policy / "scaling_cur_freq").write_text(f"{current}\n")
+        if minimum is not None:
+            (policy / "cpuinfo_min_freq").write_text(f"{minimum}\n")
+        if maximum is not None:
+            (policy / "cpuinfo_max_freq").write_text(f"{maximum}\n")
+
+    collector = SystemCollector(
+        proc_root=tmp_path / "missing-proc",
+        cpu_freq_root=freq_root,
+        cpu_sample_seconds=0,
+        battery_command=None,
+    )
+    clusters = collector._collect_cpu_frequencies()
+
+    assert [cluster.label for cluster in clusters] == [
+        "CPU 0-3",
+        "CPU 4-7",
+        "CPU 7",
+    ]
+    assert [cluster.current_khz for cluster in clusters] == [
+        1_100_000,
+        1_600_000,
+        400_000,
+    ]
+    assert clusters[0].min_khz == 400_000
+    assert clusters[0].max_khz == 2_200_000
+    assert clusters[2].min_khz is None
+    assert clusters[2].max_khz == 3_350_000
+    assert all(cluster.source == "sysfs cpufreq" for cluster in clusters)
+
+
+def test_cpu_frequency_missing_sysfs_is_silent(tmp_path: Path) -> None:
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        cpu_freq_root=tmp_path / "no-freq",
+        cpu_sample_seconds=0,
+        battery_command=None,
+    )
+    warnings: list[str] = []
+    cpu = collector._collect_cpu(warnings)
+    assert cpu.clusters == ()
+    assert warnings == []
+
+
 def test_collector_missing_proc_and_utilities_is_graceful(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail_runner(args: tuple[str, ...]) -> str:
+    def fail_runner(args: Sequence[str]) -> str:
         raise RuntimeError("utility is missing")
 
     def fail_loadavg() -> tuple[float, float, float]:
@@ -629,7 +755,7 @@ def test_collector_missing_proc_and_utilities_is_graceful(
         raise OSError("statvfs blocked")
 
     monkeypatch.setattr(os, "getloadavg", fail_loadavg)
-    monkeypatch.setattr(collectors.shutil, "disk_usage", fail_disk_usage)
+    monkeypatch.setattr(shutil, "disk_usage", fail_disk_usage)
 
     collector = SystemCollector(
         paths=(tmp_path,),
@@ -657,7 +783,7 @@ def test_collector_missing_proc_and_utilities_is_graceful(
 def test_missing_command_reports_cleanly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(collectors.shutil, "which", lambda name: None)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
     collector = SystemCollector(proc_root=tmp_path, cpu_sample_seconds=0)
     with pytest.raises(MetricUnavailable, match="command not found"):
         collector._run(("free", "-b"))
@@ -723,7 +849,7 @@ def test_static_proc_stat_falls_back_to_process_cpu_times(
         write_proc_cpu_times(tmp_path, 100, utime=210, stime=5)
         write_proc_cpu_times(tmp_path, 200, utime=20, stime=5)
 
-    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
     times = iter([100.0, 102.0])
     collector = SystemCollector(
         proc_root=tmp_path,
@@ -744,7 +870,7 @@ def test_process_cpu_fallback_when_proc_stat_is_missing(
     def advance(seconds: float) -> None:
         write_proc_cpu_times(tmp_path, 100, utime=400, stime=0)
 
-    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 2)
+    monkeypatch.setattr(os, "cpu_count", lambda: 2)
     times = iter([100.0, 102.0])
     collector = SystemCollector(
         proc_root=tmp_path,
@@ -768,7 +894,7 @@ def test_detailed_cpu_sampling_feeds_live_top_processes(
         write_proc_cpu_times(tmp_path, 100, utime=200, stime=0)
         write_proc_cpu_times(tmp_path, 200, utime=50, stime=0)
 
-    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
     times = iter([100.0, 102.0])
     collector = SystemCollector(
         proc_root=tmp_path,
@@ -816,7 +942,7 @@ def test_top_processes_fall_back_to_proc_when_ps_is_missing(
     add_proc_process(tmp_path, 1, "R", "init", resident_pages=10)
     add_proc_process(tmp_path, 2, "S", "bash", resident_pages=30)
 
-    def runner(args: tuple[str, ...]) -> str:
+    def runner(args: Sequence[str]) -> str:
         raise RuntimeError("ps is not installed")
 
     collector = SystemCollector(
@@ -828,6 +954,57 @@ def test_top_processes_fall_back_to_proc_when_ps_is_missing(
     assert source == "/proc"
     assert [process.pid for process in top] == [2, 1]
     assert top[0].memory_bytes is not None
+
+
+def test_proc_process_controls_filter_sort_and_full_command(
+    tmp_path: Path,
+) -> None:
+    add_proc_process(tmp_path, 1, "R", "init", resident_pages=10)
+    add_proc_process(tmp_path, 2, "S", "bash", resident_pages=30)
+    add_proc_process(tmp_path, 3, "R", "worker", resident_pages=20)
+    (tmp_path / "2" / "cmdline").write_bytes(b"bash\x00--login\x00")
+
+    memory_sorted = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0,
+        process_sort="mem",
+        process_limit=2,
+        battery_command=None,
+    )
+    top = memory_sorted._top_processes_from_proc()
+    assert [process.pid for process in top] == [2, 3]
+
+    pid_sorted = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0,
+        process_sort="pid",
+        process_limit=3,
+        battery_command=None,
+    )
+    assert [process.pid for process in pid_sorted._top_processes_from_proc()] == [
+        1,
+        2,
+        3,
+    ]
+
+    filtered = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0,
+        process_filter="--login",
+        full_command=True,
+        battery_command=None,
+    )
+    matching = filtered._top_processes_from_proc()
+    assert [process.pid for process in matching] == [2]
+    assert matching[0].command == "bash --login"
+
+    no_matches = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0,
+        process_filter="does-not-match",
+        battery_command=None,
+    )
+    assert no_matches._top_processes_from_proc() == ()
 
 
 def test_network_rates_use_collector_state(tmp_path: Path) -> None:
@@ -846,6 +1023,8 @@ def test_network_rates_use_collector_state(tmp_path: Path) -> None:
     assert first is not None
     assert first.rx_rate is None
     assert first.tx_rate is None
+    assert first.interface_details[0].rx_rate is None
+    assert first.interface_details[0].tx_rate is None
 
     updated = (
         "wlan0: 4000 20 0 0 0 0 0 0 1500 5 0 0 0 0 0 0\n"
@@ -859,6 +1038,8 @@ def test_network_rates_use_collector_state(tmp_path: Path) -> None:
     assert second.tx_rate == 100.0
     assert second.rx_bytes == 4000
     assert second.tx_bytes == 1500
+    assert second.interface_details[0].rx_rate == 200.0
+    assert second.interface_details[0].tx_rate == 100.0
 
 
 def test_network_rates_reset_when_source_changes(tmp_path: Path) -> None:
@@ -900,6 +1081,8 @@ def test_network_rates_reset_when_source_changes(tmp_path: Path) -> None:
     assert third is not None
     assert third.rx_rate == 1000.0
     assert third.tx_rate == 2000.0
+    assert third.interface_details[0].rx_rate == 1000.0
+    assert third.interface_details[0].tx_rate == 2000.0
     assert warnings == []
 
 
@@ -928,8 +1111,8 @@ def test_network_falls_back_to_android_netstats(tmp_path: Path) -> None:
     )
     calls: list[tuple[str, ...]] = []
 
-    def runner(args: tuple[str, ...]) -> str:
-        calls.append(args)
+    def runner(args: Sequence[str]) -> str:
+        calls.append(tuple(args))
         assert args[0] == str(service)
         return next(outputs)
 
@@ -968,7 +1151,7 @@ def test_network_reports_all_sources_when_unavailable(
     proc = tmp_path / "proc"
     proc.mkdir()
 
-    def runner(args: tuple[str, ...]) -> str:
+    def runner(args: Sequence[str]) -> str:
         raise RuntimeError("not supported")
 
     collector = SystemCollector(
@@ -998,7 +1181,7 @@ def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
     add_proc_process(proc, 10, "R", "python", resident_pages=20)
     add_proc_process(proc, 11, "S", "bash", resident_pages=10)
 
-    def runner(args: tuple[str, ...]) -> str:
+    def runner(args: Sequence[str]) -> str:
         if args[0] == "free":
             return FREE_BYTES
         if args[0] == "ps":
@@ -1010,6 +1193,7 @@ def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
     collector = SystemCollector(
         paths=(tmp_path,),
         proc_root=proc,
+        cpu_freq_root=tmp_path / "no-freq",
         runner=runner,
         cpu_sample_seconds=0,
         monotonic=lambda: 100.0,
@@ -1019,6 +1203,7 @@ def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
     assert snapshot.network is not None
     assert snapshot.network.rx_bytes == 2000
     assert snapshot.network.interfaces == 1
+    assert snapshot.network.interface_details[0].name == "wlan0"
     assert snapshot.processes is not None
     assert snapshot.processes.total == 2
     assert snapshot.processes.running == 1

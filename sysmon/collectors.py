@@ -17,16 +17,18 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
 from .models import (
     BatteryStats,
+    CpuClusterStats,
     CpuStats,
     DiskStats,
     LoadAverage,
     MemoryStats,
+    NetworkInterfaceStats,
     NetworkStats,
     ProcessInfo,
     ProcessStats,
@@ -372,6 +374,8 @@ def parse_termux_battery(text: str) -> BatteryStats:
         technology=technology,
         voltage_mv=_optional_int(data.get("voltage")),
         current_ua=_optional_int(data.get("current")),
+        current_average_ua=_optional_int(data.get("current_average")),
+        charge_counter_uah=_optional_int(data.get("charge_counter")),
     )
 
 
@@ -443,11 +447,15 @@ def _network_stats_from_entries(
     """Build network totals, preferring non-loopback interfaces."""
 
     non_loopback = [entry for entry in entries if entry[0] != "lo"]
-    selected = non_loopback or entries
+    selected = sorted(non_loopback or entries, key=lambda entry: entry[0])
     return NetworkStats(
         rx_bytes=sum(entry[1] for entry in selected),
         tx_bytes=sum(entry[2] for entry in selected),
         interfaces=len(selected),
+        interface_details=tuple(
+            NetworkInterfaceStats(name=name, rx_bytes=rx, tx_bytes=tx)
+            for name, rx, tx in selected
+        ),
         source=source,
     )
 
@@ -572,10 +580,7 @@ def parse_android_netstats(text: str) -> NetworkStats:
 
     # AIDL writes a presence flag for the nullable StatsResult, followed by the
     # parcelable's size (36 bytes) and four longs.
-    if len(words) >= 4 and words[1] == 1:
-        size_index = 2
-    else:
-        size_index = 1
+    size_index = 2 if len(words) >= 4 and words[1] == 1 else 1
     if len(words) < size_index + 9 or words[size_index] != 36:
         raise MetricUnavailable("netstats returned an unsupported response")
 
@@ -596,11 +601,20 @@ _PS_ROW = re.compile(
 
 
 def parse_ps_processes(
-    text: str, limit: int = MAX_TOP_PROCESSES
+    text: str,
+    limit: int = MAX_TOP_PROCESSES,
+    *,
+    sort_by: str = "cpu",
+    filter_pattern: str | None = None,
 ) -> tuple[ProcessInfo, ...]:
-    """Parse ``ps -eo pid=,pcpu=,rss=,comm=`` output."""
+    """Parse ``ps -eo pid=,pcpu=,rss=,comm=`` output.
 
-    processes: list[ProcessInfo] = []
+    A filter is applied after parsing but before sorting and limiting, so the
+    caller can show only matching processes without changing process counts.
+    """
+
+    pattern = re.compile(filter_pattern) if filter_pattern else None
+    parsed: list[ProcessInfo] = []
     for line in text.splitlines():
         match = _PS_ROW.match(line)
         if not match:
@@ -611,10 +625,10 @@ def parse_ps_processes(
             continue
         rss_kb = int(match.group(3))
         command = match.group(4).strip() or f"[{pid}]"
-        if command == "ps":
+        if _is_ps_command(command):
             # The ps process itself often reports a misleading 100% CPU.
             continue
-        processes.append(
+        parsed.append(
             ProcessInfo(
                 pid=pid,
                 command=command,
@@ -623,16 +637,45 @@ def parse_ps_processes(
             )
         )
 
-    if not processes:
+    if not parsed:
         raise MetricUnavailable("ps returned no parsable process rows")
-    processes.sort(
+    selected = [
+        process
+        for process in parsed
+        if pattern is None or pattern.search(process.command)
+    ]
+    return tuple(_sort_processes(selected, sort_by)[:limit])
+
+
+def _sort_processes(
+    processes: Sequence[ProcessInfo], sort_by: str
+) -> list[ProcessInfo]:
+    if sort_by == "pid":
+        return sorted(processes, key=lambda process: process.pid)
+    if sort_by == "mem":
+        return sorted(
+            processes,
+            key=lambda process: (
+                process.memory_bytes or -1,
+                process.cpu_percent or -1,
+                process.pid,
+            ),
+            reverse=True,
+        )
+    return sorted(
+        processes,
         key=lambda process: (
-            process.cpu_percent or 0.0,
+            process.cpu_percent if process.cpu_percent is not None else -1.0,
             process.memory_bytes or 0,
+            process.pid,
         ),
         reverse=True,
     )
-    return tuple(processes[:limit])
+
+
+def _is_ps_command(command: str) -> bool:
+    fields = command.split(None, 1)
+    return bool(fields) and fields[0].rsplit("/", 1)[-1] == "ps"
 
 
 class SystemCollector:
@@ -651,6 +694,11 @@ class SystemCollector:
         android_service: Path = Path("/system/bin/service"),
         cgroup_root: Path = Path("/sys/fs/cgroup"),
         os_release: Path = Path("/etc/os-release"),
+        cpu_freq_root: Path = Path("/sys/devices/system/cpu/cpufreq"),
+        process_limit: int = MAX_TOP_PROCESSES,
+        process_sort: str = "cpu",
+        process_filter: str | None = None,
+        full_command: bool = False,
         cpu_sample_seconds: float = 0.12,
         command_timeout: float = 2.0,
         battery_command: Sequence[str] | None = ("termux-battery-status",),
@@ -667,6 +715,25 @@ class SystemCollector:
         self.android_service = Path(android_service)
         self.cgroup_root = Path(cgroup_root)
         self.os_release = Path(os_release)
+        self.cpu_freq_root = Path(cpu_freq_root)
+        if process_limit < 1:
+            raise ValueError("process_limit must be at least 1")
+        if process_sort not in {"cpu", "mem", "pid"}:
+            raise ValueError("process_sort must be cpu, mem, or pid")
+        self.process_limit = process_limit
+        self.process_sort = process_sort
+        self.process_filter = process_filter.strip() if process_filter else None
+        self.full_command = full_command
+        try:
+            self._process_pattern = (
+                re.compile(self.process_filter)
+                if self.process_filter is not None
+                else None
+            )
+        except re.error as exc:
+            raise ValueError(
+                f"process_filter is not a valid regular expression: {exc}"
+            ) from exc
         self.cpu_sample_seconds = max(0.0, cpu_sample_seconds)
         self.command_timeout = command_timeout
         self.battery_command = tuple(battery_command) if battery_command else None
@@ -677,8 +744,13 @@ class SystemCollector:
         self.sleep = sleep
         self.monotonic = monotonic
         self._last_network: tuple[float, int, int, str] | None = None
+        self._last_interfaces: (
+            tuple[float, dict[str, tuple[int, int]], str] | None
+        ) = None
         self._last_uptime: tuple[float, float, float, str] | None = None
-        self._last_process_sample: tuple[float, dict[int, int]] | None = None
+        self._last_process_sample: (
+            tuple[float, Mapping[int, int]] | None
+        ) = None
         self._process_cpu_rates: dict[int, float] = {}
         self._battery_cache: tuple[float, BatteryStats | None, str | None] | None = None
 
@@ -729,6 +801,7 @@ class SystemCollector:
         except (OSError, ValueError, MetricUnavailable) as exc:
             usage_error = str(exc)
 
+        clusters = self._collect_cpu_frequencies()
         sources = [source for source in (load_source, usage_source) if source]
         if load_error and usage_error:
             warnings.append(
@@ -743,8 +816,52 @@ class SystemCollector:
             load=load,
             usage_percent=usage,
             cores=cores,
+            clusters=clusters,
             source=" + ".join(sources) if sources else "unavailable",
         )
+
+    def _collect_cpu_frequencies(self) -> tuple[CpuClusterStats, ...]:
+        """Read per-policy CPU frequencies from cpufreq sysfs.
+
+        Files may be absent on kernels or containers without cpufreq support;
+        that is not an error, so this silently returns an empty tuple.
+        """
+
+        try:
+            policies = sorted(
+                (
+                    path
+                    for path in self.cpu_freq_root.iterdir()
+                    if path.name.startswith("policy") and path.is_dir()
+                ),
+                key=_policy_sort_key,
+            )
+        except OSError:
+            return ()
+
+        clusters: list[CpuClusterStats] = []
+        for policy in policies:
+            current = _read_int_file(policy / "scaling_cur_freq")
+            if current is None:
+                continue
+            minimum = _first_readable_int(
+                policy,
+                ("cpuinfo_min_freq", "scaling_min_freq"),
+            )
+            maximum = _first_readable_int(
+                policy,
+                ("cpuinfo_max_freq", "scaling_max_freq"),
+            )
+            cpus = _read_int_list(policy / "affected_cpus")
+            clusters.append(
+                CpuClusterStats(
+                    label=_cpu_label(cpus) or policy.name,
+                    current_khz=current,
+                    min_khz=minimum,
+                    max_khz=maximum,
+                )
+            )
+        return tuple(clusters)
 
     def _read_load(self) -> tuple[LoadAverage, str]:
         loadavg_path = self.proc_root / "loadavg"
@@ -852,7 +969,7 @@ class SystemCollector:
             and cgroup_after >= cgroup_before
             and elapsed > 0
         ):
-            usage = (
+            cgroup_usage = (
                 (cgroup_after - cgroup_before)
                 / 1_000_000.0
                 / elapsed
@@ -866,7 +983,7 @@ class SystemCollector:
                     elapsed,
                     sample_end,
                 )
-            return max(0.0, min(100.0, usage)), "cgroup v2"
+            return max(0.0, min(100.0, cgroup_usage)), "cgroup v2"
 
         after: CpuTimes | None = None
         if before is not None:
@@ -1107,9 +1224,16 @@ class SystemCollector:
             if now - checked_at < self.battery_cache_seconds:
                 if error:
                     warnings.append(f"Battery: {error}")
+                if stats is not None:
+                    stats = replace(
+                        stats,
+                        cache_age_seconds=max(0.0, now - checked_at),
+                    )
                 return stats
 
         stats, error = self._read_battery()
+        if stats is not None:
+            stats = replace(stats, cache_age_seconds=0.0)
         self._battery_cache = (now, stats, error)
         if error:
             warnings.append(f"Battery: {error}")
@@ -1182,12 +1306,42 @@ class SystemCollector:
                 tx_rate = (stats.tx_bytes - previous_tx) / elapsed
         self._last_network = (now, stats.rx_bytes, stats.tx_bytes, stats.source)
 
+        interface_details = stats.interface_details
+        if self._last_interfaces is not None:
+            previous_time, previous_map, previous_source = self._last_interfaces
+            elapsed = now - previous_time
+            if previous_source == stats.source and elapsed > 0:
+                with_rates: list[NetworkInterfaceStats] = []
+                for interface in interface_details:
+                    previous = previous_map.get(interface.name)
+                    if (
+                        previous is not None
+                        and interface.rx_bytes >= previous[0]
+                        and interface.tx_bytes >= previous[1]
+                    ):
+                        interface = replace(
+                            interface,
+                            rx_rate=(interface.rx_bytes - previous[0]) / elapsed,
+                            tx_rate=(interface.tx_bytes - previous[1]) / elapsed,
+                        )
+                    with_rates.append(interface)
+                interface_details = tuple(with_rates)
+        self._last_interfaces = (
+            now,
+            {
+                interface.name: (interface.rx_bytes, interface.tx_bytes)
+                for interface in interface_details
+            },
+            stats.source,
+        )
+
         return NetworkStats(
             rx_bytes=stats.rx_bytes,
             tx_bytes=stats.tx_bytes,
             rx_rate=rx_rate,
             tx_rate=tx_rate,
             interfaces=stats.interfaces,
+            interface_details=interface_details,
             source=stats.source,
         )
 
@@ -1223,6 +1377,9 @@ class SystemCollector:
             running=running,
             top=top,
             source=top_source,
+            sort=self.process_sort,
+            limit=self.process_limit,
+            filter=self.process_filter,
         )
 
     def _process_counts(self) -> tuple[int, int]:
@@ -1251,9 +1408,18 @@ class SystemCollector:
             except (OSError, ValueError, MetricUnavailable) as exc:
                 errors.append(f"/proc unavailable ({exc})")
 
+        columns = "args" if self.full_command else "comm"
         try:
-            output = self._run(("ps", "-eo", "pid=,pcpu=,rss=,comm="))
-            return parse_ps_processes(output), "ps"
+            output = self._run(("ps", "-eo", f"pid=,pcpu=,rss=,{columns}="))
+            return (
+                parse_ps_processes(
+                    output,
+                    self.process_limit,
+                    sort_by=self.process_sort,
+                    filter_pattern=self.process_filter,
+                ),
+                "ps",
+            )
         except MetricUnavailable as exc:
             errors.append(f"ps unavailable ({exc})")
 
@@ -1270,7 +1436,8 @@ class SystemCollector:
         except (OSError, ValueError) as exc:
             raise MetricUnavailable(f"cannot determine page size: {exc}") from exc
 
-        processes: list[ProcessInfo] = []
+        selected: list[ProcessInfo] = []
+        readable = 0
         for entry in self.proc_root.iterdir():
             if not entry.name.isdigit():
                 continue
@@ -1281,30 +1448,44 @@ class SystemCollector:
                 continue
             if resident_pages <= 0:
                 continue
-            try:
-                command = _read_text(entry / "comm").strip()
-            except OSError:
-                command = ""
+            readable += 1
             pid = int(entry.name)
-            processes.append(
+            command = self._process_command(entry, pid)
+            if (
+                self._process_pattern is not None
+                and not self._process_pattern.search(command)
+            ):
+                continue
+            selected.append(
                 ProcessInfo(
                     pid=pid,
-                    command=command or f"[{pid}]",
+                    command=command,
                     cpu_percent=self._process_cpu_rates.get(pid),
                     memory_bytes=resident_pages * page_size,
                 )
             )
 
-        if not processes:
+        if readable == 0:
             raise MetricUnavailable("/proc contains no readable process data")
-        processes.sort(
-            key=lambda process: (
-                process.cpu_percent if process.cpu_percent is not None else -1.0,
-                process.memory_bytes or 0,
-            ),
-            reverse=True,
-        )
-        return tuple(processes[:MAX_TOP_PROCESSES])
+        return tuple(_sort_processes(selected, self.process_sort)[: self.process_limit])
+
+    def _process_command(self, entry: Path, pid: int) -> str:
+        if self.full_command:
+            try:
+                command = (
+                    _read_text(entry / "cmdline")
+                    .replace("\x00", " ")
+                    .strip()
+                )
+            except OSError:
+                command = ""
+            if command:
+                return command
+        try:
+            command = _read_text(entry / "comm").strip()
+        except OSError:
+            command = ""
+        return command or f"[{pid}]"
 
     def _run(
         self, args: Sequence[str], *, timeout: float | None = None
@@ -1358,12 +1539,69 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def _read_int_file(path: Path) -> int | None:
+    try:
+        value = int(_read_text(path).strip())
+    except (OSError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _first_readable_int(
+    directory: Path, names: Sequence[str]
+) -> int | None:
+    for name in names:
+        value = _read_int_file(directory / name)
+        if value is not None:
+            return value
+    return None
+
+
+def _read_int_list(path: Path) -> list[int]:
+    try:
+        values = [int(field) for field in _read_text(path).split()]
+    except (OSError, ValueError):
+        return []
+    return sorted({value for value in values if value >= 0})
+
+
+def _policy_sort_key(path: Path) -> tuple[int, str]:
+    match = re.search(r"(\d+)$", path.name)
+    return (int(match.group(1)) if match else 10**9, path.name)
+
+
+def _cpu_label(cpus: Sequence[int]) -> str | None:
+    if not cpus:
+        return None
+    ordered = sorted(set(cpus))
+    ranges: list[tuple[int, int]] = []
+    start = previous = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        ranges.append((start, previous))
+        start = previous = cpu
+    ranges.append((start, previous))
+
+    labels = [
+        str(first) if first == last else f"{first}-{last}"
+        for first, last in ranges
+    ]
+    return "CPU " + ",".join(labels)
+
+
 def _optional_float(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, (int, float)):
         number = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
         return None
     return number if math.isfinite(number) else None
 
