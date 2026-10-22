@@ -31,6 +31,7 @@ from sysmon.collectors import (
     parse_os_release,
     parse_ps_processes,
     parse_sysfs_net,
+    parse_termux_battery,
     parse_uptime,
 )
 
@@ -80,6 +81,25 @@ IP_LINK_JSON = """\
   {"ifname": "eth0", "stats64": {"rx": {"bytes": 5000}, "tx": {"bytes": 2500}}},
   {"ifname": "wlan0", "stats": {"rx": {"bytes": 3000}, "tx": {"bytes": 1500}}}
 ]
+"""
+
+BATTERY_JSON = """\
+{
+  "present": true,
+  "technology": "Li-poly",
+  "health": "GOOD",
+  "plugged": "UNPLUGGED",
+  "status": "DISCHARGING",
+  "temperature": 37.5,
+  "voltage": 3813,
+  "current": 801000,
+  "current_average": -3000,
+  "percentage": 45,
+  "level": 45,
+  "scale": 100,
+  "charge_counter": 2015000,
+  "cycle": 789
+}
 """
 
 ANDROID_NETSTATS = """\
@@ -346,6 +366,126 @@ def test_parse_os_release() -> None:
     assert parse_os_release("") is None
 
 
+def test_parse_termux_battery() -> None:
+    battery = parse_termux_battery(BATTERY_JSON)
+
+    assert battery.present
+    assert battery.percentage == 45
+    assert battery.status == "DISCHARGING"
+    assert battery.plugged == "UNPLUGGED"
+    assert battery.temperature_c == 37.5
+    assert battery.health == "GOOD"
+    assert battery.technology == "Li-poly"
+    assert battery.voltage_mv == 3813
+    assert battery.current_ua == 801000
+    assert battery.source == "termux-battery-status"
+
+
+def test_parse_termux_battery_percentage_fallback() -> None:
+    battery = parse_termux_battery(
+        '{"present": true, "level": 50, "scale": 200, "status": "FULL"}'
+    )
+    assert battery.percentage == 25.0
+
+    clamped = parse_termux_battery(
+        '{"present": true, "percentage": 120, "status": "FULL"}'
+    )
+    assert clamped.percentage == 100.0
+
+
+def test_parse_termux_battery_absent_and_invalid() -> None:
+    absent = parse_termux_battery('{"present": false}')
+    assert absent.present is False
+    assert absent.percentage is None
+
+    with pytest.raises(MetricUnavailable):
+        parse_termux_battery("not json")
+    with pytest.raises(MetricUnavailable):
+        parse_termux_battery("[]")
+    with pytest.raises(MetricUnavailable):
+        parse_termux_battery('{"present": "yes"}')
+    with pytest.raises(MetricUnavailable):
+        parse_termux_battery("{}")
+
+
+def test_battery_collection_caches_termux_command(tmp_path: Path) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args: tuple[str, ...]) -> str:
+        calls.append(args)
+        return BATTERY_JSON
+
+    times = iter([100.0, 101.0, 131.0])
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        runner=runner,
+        battery_cache_seconds=30,
+        monotonic=lambda: next(times),
+    )
+    warnings: list[str] = []
+
+    first = collector._collect_battery(warnings)
+    second = collector._collect_battery(warnings)
+    third = collector._collect_battery(warnings)
+
+    assert first is not None and first.percentage == 45
+    assert second is first
+    assert third is not None and third.percentage == 45
+    assert calls == [
+        ("termux-battery-status",),
+        ("termux-battery-status",),
+    ]
+    assert warnings == []
+
+
+def test_battery_missing_command_is_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(collectors.shutil, "which", lambda name: None)
+    collector = SystemCollector(proc_root=tmp_path, monotonic=lambda: 100.0)
+    warnings: list[str] = []
+
+    assert collector._collect_battery(warnings) is None
+    assert warnings == []
+
+
+def test_battery_absent_is_silent(tmp_path: Path) -> None:
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        runner=lambda args: '{"present": false}',
+        monotonic=lambda: 100.0,
+    )
+    warnings: list[str] = []
+
+    assert collector._collect_battery(warnings) is None
+    assert warnings == []
+
+
+def test_battery_failure_is_cached(tmp_path: Path) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args: tuple[str, ...]) -> str:
+        calls.append(args)
+        raise RuntimeError("Termux:API unavailable")
+
+    times = iter([100.0, 101.0])
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        runner=runner,
+        battery_cache_seconds=30,
+        monotonic=lambda: next(times),
+    )
+    warnings: list[str] = []
+    cached_warnings: list[str] = []
+
+    assert collector._collect_battery(warnings) is None
+    assert collector._collect_battery(cached_warnings) is None
+
+    assert len(calls) == 1
+    assert warnings and "Battery:" in warnings[0]
+    assert cached_warnings and "Battery:" in cached_warnings[0]
+
+
 def test_collector_uses_command_fallbacks(tmp_path: Path) -> None:
     proc = tmp_path / "proc"
     proc.mkdir()
@@ -365,6 +505,7 @@ def test_collector_uses_command_fallbacks(tmp_path: Path) -> None:
         proc_root=proc,
         runner=runner,
         cpu_sample_seconds=0,
+        battery_command=None,
     )
     snapshot = collector.collect()
 
@@ -495,6 +636,7 @@ def test_collector_missing_proc_and_utilities_is_graceful(
         proc_root=tmp_path / "does-not-exist",
         runner=fail_runner,
         cpu_sample_seconds=0,
+        battery_command=None,
     )
     snapshot = collector.collect()
 
@@ -861,6 +1003,8 @@ def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
             return FREE_BYTES
         if args[0] == "ps":
             return PS_OUTPUT
+        if args[0] == "termux-battery-status":
+            return BATTERY_JSON
         raise AssertionError(f"unexpected command: {args}")
 
     collector = SystemCollector(
@@ -880,12 +1024,15 @@ def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
     assert snapshot.processes.running == 1
     assert snapshot.processes.top[0].pid == 789
     assert snapshot.processes.source == "ps"
+    assert snapshot.battery is not None
+    assert snapshot.battery.percentage == 45
+    assert snapshot.battery.source == "termux-battery-status"
     assert snapshot.warnings == ()
 
 
 @pytest.mark.skipif(not Path("/proc/meminfo").exists(), reason="requires Linux /proc")
 def test_real_snapshot_on_this_host() -> None:
-    snapshot = SystemCollector(cpu_sample_seconds=0).collect()
+    snapshot = SystemCollector(cpu_sample_seconds=0, battery_command=None).collect()
     assert snapshot.hostname
     assert snapshot.os_name
     assert snapshot.cpu is not None

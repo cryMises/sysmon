@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .models import (
+    BatteryStats,
     CpuStats,
     DiskStats,
     LoadAverage,
@@ -326,6 +327,54 @@ def parse_os_release(text: str) -> str | None:
     return values.get("PRETTY_NAME") or values.get("NAME") or None
 
 
+def parse_termux_battery(text: str) -> BatteryStats:
+    """Parse JSON returned by ``termux-battery-status``."""
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricUnavailable("invalid battery JSON") from exc
+    if not isinstance(data, dict):
+        raise MetricUnavailable("battery JSON is not an object")
+
+    present = data.get("present", True)
+    if not isinstance(present, bool):
+        raise MetricUnavailable("battery 'present' is not a boolean")
+    if not present:
+        return BatteryStats(present=False)
+
+    percentage = _optional_float(data.get("percentage"))
+    if percentage is None:
+        level = _optional_float(data.get("level"))
+        scale = _optional_float(data.get("scale"))
+        if level is not None and scale is not None and scale > 0:
+            percentage = level / scale * 100.0
+    if percentage is not None:
+        percentage = max(0.0, min(100.0, percentage))
+
+    status = _optional_text(data.get("status"))
+    plugged = _optional_text(data.get("plugged"))
+    temperature = _optional_float(data.get("temperature"))
+    health = _optional_text(data.get("health"))
+    technology = _optional_text(data.get("technology"))
+    if all(
+        value is None
+        for value in (percentage, status, plugged, temperature, health, technology)
+    ):
+        raise MetricUnavailable("battery JSON contains no status fields")
+
+    return BatteryStats(
+        percentage=percentage,
+        status=status,
+        plugged=plugged,
+        temperature_c=temperature,
+        health=health,
+        technology=technology,
+        voltage_mv=_optional_int(data.get("voltage")),
+        current_ua=_optional_int(data.get("current")),
+    )
+
+
 def parse_cgroup_cpu_max(text: str) -> float | None:
     """Parse a cgroup v2 ``cpu.max`` quota into an effective core count.
 
@@ -604,6 +653,9 @@ class SystemCollector:
         os_release: Path = Path("/etc/os-release"),
         cpu_sample_seconds: float = 0.12,
         command_timeout: float = 2.0,
+        battery_command: Sequence[str] | None = ("termux-battery-status",),
+        battery_timeout: float = 5.0,
+        battery_cache_seconds: float = 30.0,
         runner: CommandRunner | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -617,6 +669,9 @@ class SystemCollector:
         self.os_release = Path(os_release)
         self.cpu_sample_seconds = max(0.0, cpu_sample_seconds)
         self.command_timeout = command_timeout
+        self.battery_command = tuple(battery_command) if battery_command else None
+        self.battery_timeout = max(0.1, battery_timeout)
+        self.battery_cache_seconds = max(0.0, battery_cache_seconds)
         self.runner = runner
         self.clock = clock
         self.sleep = sleep
@@ -625,6 +680,7 @@ class SystemCollector:
         self._last_uptime: tuple[float, float, float, str] | None = None
         self._last_process_sample: tuple[float, dict[int, int]] | None = None
         self._process_cpu_rates: dict[int, float] = {}
+        self._battery_cache: tuple[float, BatteryStats | None, str | None] | None = None
 
     def collect(self, detailed: bool = False) -> Snapshot:
         warnings: list[str] = []
@@ -634,6 +690,7 @@ class SystemCollector:
         uptime = self._collect_uptime(warnings)
         network = self._collect_network(warnings) if detailed else None
         processes = self._collect_processes(warnings) if detailed else None
+        battery = self._collect_battery(warnings)
 
         return Snapshot(
             timestamp=self.clock(),
@@ -647,6 +704,7 @@ class SystemCollector:
             hostname=platform.node().strip() or "unknown",
             os_name=self._read_os_name(),
             machine=platform.machine().strip() or "unknown",
+            battery=battery,
         )
 
     def _collect_cpu(
@@ -1035,6 +1093,42 @@ class SystemCollector:
             )
             return None
 
+    def _collect_battery(self, warnings: list[str]) -> BatteryStats | None:
+        """Read battery state via Termux:API, caching slow command results."""
+
+        if self.battery_command is None:
+            return None
+        if self.runner is None and shutil.which(self.battery_command[0]) is None:
+            return None
+
+        now = self.monotonic()
+        if self._battery_cache is not None:
+            checked_at, stats, error = self._battery_cache
+            if now - checked_at < self.battery_cache_seconds:
+                if error:
+                    warnings.append(f"Battery: {error}")
+                return stats
+
+        stats, error = self._read_battery()
+        self._battery_cache = (now, stats, error)
+        if error:
+            warnings.append(f"Battery: {error}")
+        return stats
+
+    def _read_battery(self) -> tuple[BatteryStats | None, str | None]:
+        assert self.battery_command is not None
+        try:
+            output = self._run(self.battery_command, timeout=self.battery_timeout)
+            battery = parse_termux_battery(output)
+        except MetricUnavailable as exc:
+            if "command not found" in str(exc):
+                return None, None
+            return None, str(exc)
+
+        if not battery.present:
+            return None, None
+        return battery, None
+
     def _collect_network(self, warnings: list[str]) -> NetworkStats | None:
         errors: list[str] = []
         stats: NetworkStats | None = None
@@ -1212,7 +1306,9 @@ class SystemCollector:
         )
         return tuple(processes[:MAX_TOP_PROCESSES])
 
-    def _run(self, args: Sequence[str]) -> str:
+    def _run(
+        self, args: Sequence[str], *, timeout: float | None = None
+    ) -> str:
         if self.runner is not None:
             try:
                 output = self.runner(tuple(args))
@@ -1235,7 +1331,7 @@ class SystemCollector:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.command_timeout,
+                timeout=timeout if timeout is not None else self.command_timeout,
                 check=False,
                 env={**os.environ, "LC_ALL": "C"},
             )
@@ -1260,3 +1356,24 @@ class SystemCollector:
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _optional_int(value: object) -> int | None:
+    number = _optional_float(value)
+    return int(number) if number is not None else None
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None

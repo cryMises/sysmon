@@ -156,6 +156,34 @@ class ProcessStats:
 
 
 @dataclass(frozen=True)
+class BatteryStats:
+    present: bool = True
+    percentage: float | None = None
+    status: str | None = None
+    plugged: str | None = None
+    temperature_c: float | None = None
+    health: str | None = None
+    technology: str | None = None
+    voltage_mv: int | None = None
+    current_ua: int | None = None
+    source: str = "termux-battery-status"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "present": self.present,
+            "percentage": _rounded(self.percentage),
+            "status": self.status,
+            "plugged": self.plugged,
+            "temperature_c": _rounded(self.temperature_c),
+            "health": self.health,
+            "technology": self.technology,
+            "voltage_mv": self.voltage_mv,
+            "current_ua": self.current_ua,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """A complete, immutable sample of the host."""
 
@@ -170,6 +198,7 @@ class Snapshot:
     hostname: str
     os_name: str
     machine: str
+    battery: BatteryStats | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -185,6 +214,7 @@ class Snapshot:
             "uptime": self.uptime.to_dict(self.timestamp) if self.uptime else None,
             "network": self.network.to_dict() if self.network else None,
             "processes": self.processes.to_dict() if self.processes else None,
+            "battery": self.battery.to_dict() if self.battery else None,
             "warnings": list(self.warnings),
         }
         return data

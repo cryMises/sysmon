@@ -37,6 +37,13 @@ def test_dashboard_shows_every_required_metric(sample_snapshot: Snapshot) -> Non
     assert "42.0%" in output
     assert "Uptime" in output
     assert "1d 1h 1m" in output
+    assert "Battery" in output
+    assert "45.0%" in output
+    assert "Discharging · Unplugged" in output
+    assert "37.5°C" in output
+    assert "Good" in output
+    assert "Li-poly" in output
+    assert "src: termux-battery-status" in output
     assert "Warnings" not in output
 
 
@@ -45,6 +52,7 @@ def test_narrow_terminal_stacks_panels(sample_snapshot: Snapshot) -> None:
 
     assert output.index("CPU") < output.index("Memory") < output.index("Disk")
     assert output.index("Disk") < output.index("Uptime")
+    assert output.index("Uptime") < output.index("Battery")
     assert "3.0 GiB used / 8.0 GiB total" in output
 
 
@@ -71,6 +79,7 @@ def test_missing_sections_render_without_crashing(sample_snapshot: Snapshot) -> 
         memory=None,
         disks=(),
         uptime=None,
+        battery=None,
         warnings=("Everything unavailable",),
     )
     output = _render(snapshot, width=100)
@@ -78,6 +87,7 @@ def test_missing_sections_render_without_crashing(sample_snapshot: Snapshot) -> 
     assert "Memory data unavailable" in output
     assert "Disk usage unavailable" in output
     assert "Uptime unavailable" in output
+    assert "Battery" not in output
 
 
 def test_live_mode_adds_network_process_and_session_details(
@@ -123,5 +133,10 @@ def test_live_narrow_layout_stacks_extra_panels(live_snapshot: Snapshot) -> None
     output = _render(
         live_snapshot, width=60, live=True, sample=2, session_seconds=5
     )
-    assert output.index("Uptime") < output.index("Network") < output.index("Processes")
+    assert (
+        output.index("Uptime")
+        < output.index("Battery")
+        < output.index("Network")
+        < output.index("Processes")
+    )
     assert "watching" in output

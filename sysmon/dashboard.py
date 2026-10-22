@@ -18,6 +18,7 @@ from .formatting import (
     format_rate,
 )
 from .models import (
+    BatteryStats,
     CpuStats,
     DiskStats,
     MemoryStats,
@@ -52,6 +53,7 @@ def render_dashboard(
     memory_panel = _memory_panel(snapshot.memory, bar_width, ascii_bars)
     disk_panel = _disk_panel(snapshot.disks, bar_width, ascii_bars)
     uptime_panel = _uptime_panel(snapshot.uptime, snapshot.timestamp)
+    battery_panel = _battery_panel(snapshot.battery, bar_width, ascii_bars)
     network_panel = _network_panel(snapshot.network)
     processes_panel = _processes_panel(snapshot.processes)
 
@@ -63,11 +65,22 @@ def render_dashboard(
         grid.add_column(ratio=1)
         grid.add_row(cpu_panel, memory_panel)
         grid.add_row(disk_panel, uptime_panel)
-        if live:
+        if live and battery_panel is None:
             grid.add_row(network_panel, processes_panel)
         parts.append(grid)
+
+        if battery_panel is not None:
+            parts.append(battery_panel)
+            if live:
+                live_grid = Table.grid(expand=True, padding=(0, 1))
+                live_grid.add_column(ratio=1)
+                live_grid.add_column(ratio=1)
+                live_grid.add_row(network_panel, processes_panel)
+                parts.append(live_grid)
     else:
         parts.extend([cpu_panel, memory_panel, disk_panel, uptime_panel])
+        if battery_panel is not None:
+            parts.append(battery_panel)
         if live:
             parts.extend([network_panel, processes_panel])
 
@@ -221,6 +234,55 @@ def _uptime_panel(uptime: UptimeStats | None, now: float) -> Panel:
     return _panel("Uptime", body, "green", uptime.source)
 
 
+def _battery_panel(
+    battery: BatteryStats | None, bar_width: int, ascii_bars: bool
+) -> Panel | None:
+    if battery is None or not battery.present:
+        return None
+
+    details: list[Text] = []
+    state = " · ".join(
+        label
+        for label in (
+            _battery_label(battery.status),
+            _battery_label(battery.plugged),
+        )
+        if label
+    )
+    if state:
+        details.append(Text(state, style="bold"))
+
+    meta: list[str] = []
+    if battery.temperature_c is not None:
+        meta.append(f"{battery.temperature_c:.1f}°C")
+    health = _battery_label(battery.health)
+    if health:
+        meta.append(health)
+    if battery.technology:
+        meta.append(battery.technology)
+    if meta:
+        details.append(Text(" · ".join(meta), style="dim"))
+    if not details:
+        details.append(Text("Battery details unavailable", style="dim"))
+
+    table = Table.grid(expand=True, padding=(0, 2))
+    table.add_column(no_wrap=True)
+    table.add_column(ratio=1)
+    table.add_row(
+        _meter(battery.percentage, bar_width, ascii_bars, battery=True),
+        Group(*details),
+    )
+    return _panel("Battery", table, "bright_green", battery.source)
+
+
+def _battery_label(value: str | None) -> str | None:
+    if not value:
+        return None
+    special = {"usb": "USB", "ac": "AC"}
+    words = value.replace("_", " ").split()
+    return " ".join(special.get(word.lower(), word.capitalize()) for word in words)
+
+
 def _network_panel(network: NetworkStats | None) -> Panel:
     if network is None:
         body = Text("Network data unavailable", style="yellow")
@@ -370,12 +432,18 @@ def _panel(
     )
 
 
-def _meter(percent: float | None, width: int, ascii_bars: bool) -> Text:
+def _meter(
+    percent: float | None,
+    width: int,
+    ascii_bars: bool,
+    *,
+    battery: bool = False,
+) -> Text:
     if percent is None:
         return Text("n/a", style="dim")
 
     percent = max(0.0, min(100.0, percent))
-    style = _meter_style(percent)
+    style = _battery_meter_style(percent) if battery else _meter_style(percent)
     filled = int(round(width * percent / 100.0))
     if 0 < percent < 100:
         filled = max(1, min(width - 1, filled))
@@ -399,5 +467,13 @@ def _meter_style(percent: float) -> str:
     if percent >= 90:
         return "bold red"
     if percent >= 70:
+        return "yellow"
+    return "green"
+
+
+def _battery_meter_style(percent: float) -> str:
+    if percent <= 15:
+        return "bold red"
+    if percent <= 30:
         return "yellow"
     return "green"

@@ -65,6 +65,9 @@ def test_json_output_is_machine_readable(
     assert data["uptime"]["seconds"] == 90_061.0
     assert data["network"] is None
     assert data["processes"] is None
+    assert data["battery"]["percentage"] == 45.0
+    assert data["battery"]["status"] == "DISCHARGING"
+    assert data["battery"]["source"] == "termux-battery-status"
     assert data["warnings"] == []
     assert captured["collector"].detailed_calls == [True]
 
@@ -126,3 +129,12 @@ def test_paths_are_expanded_and_passed_to_collector(
     captured = install_fake_collector(monkeypatch, sample_snapshot)
     assert cli.main(["--once", "--path", "~/data", "--path", "."]) == 0
     assert captured["paths"] == (Path.home() / "data", Path("."))
+
+
+def test_no_battery_flag_disables_battery_collection(
+    sample_snapshot: Snapshot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = install_fake_collector(monkeypatch, sample_snapshot)
+    assert cli.main(["--once", "--no-battery"]) == 0
+    assert captured["battery_command"] is None

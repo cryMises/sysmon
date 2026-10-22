@@ -71,7 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="print raw data as JSON, including network and process details",
+        help="print raw data as JSON, including network, process, and battery details",
+    )
+    parser.add_argument(
+        "--no-battery",
+        action="store_true",
+        help="skip the termux-battery-status query",
     )
     parser.add_argument(
         "--ascii",
@@ -99,7 +104,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--json cannot be combined with --watch")
 
     paths = tuple(path.expanduser() for path in (args.paths or [Path("/")]))
-    collector = SystemCollector(paths=paths)
+    collector = SystemCollector(
+        paths=paths,
+        battery_command=None if args.no_battery else ("termux-battery-status",),
+    )
     console = Console(
         highlight=False,
         no_color=True if args.no_color else None,

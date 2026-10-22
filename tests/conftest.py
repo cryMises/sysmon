@@ -7,6 +7,7 @@ from dataclasses import replace
 import pytest
 
 from sysmon.models import (
+    BatteryStats,
     CpuStats,
     DiskStats,
     LoadAverage,
@@ -56,6 +57,16 @@ def sample_snapshot() -> Snapshot:
         hostname="termux",
         os_name="Ubuntu 26.04.1 LTS",
         machine="aarch64",
+        battery=BatteryStats(
+            percentage=45,
+            status="DISCHARGING",
+            plugged="UNPLUGGED",
+            temperature_c=37.5,
+            health="GOOD",
+            technology="Li-poly",
+            voltage_mv=3813,
+            current_ua=801000,
+        ),
     )
 
 
