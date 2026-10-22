@@ -13,9 +13,14 @@ from sysmon.collectors import (
     SystemCollector,
     calculate_cpu_usage,
     calculate_cpu_usage_since_boot,
+    calculate_process_cpu_rates,
     calculate_process_cpu_usage,
     parse_android_netstats,
     parse_boot_time,
+    parse_cgroup_cpu_max,
+    parse_cgroup_cpu_usage,
+    parse_cgroup_memory_current,
+    parse_cgroup_memory_limit,
     parse_cpu_stat,
     parse_df_k,
     parse_free_bytes,
@@ -109,6 +114,8 @@ def write_proc_cpu_times(proc: Path, pid: int, utime: int, stime: int) -> None:
     (process_dir / "stat").write_text(
         f"{pid} (worker) R 1 2 3 4 5 6 7 8 9 10 {utime} {stime} 0 0 0\n"
     )
+    (process_dir / "statm").write_text("100 10 10 0 0 0 0\n")
+    (process_dir / "comm").write_text("worker\n")
 
 
 def test_parse_loadavg() -> None:
@@ -193,6 +200,32 @@ def test_parse_boot_time() -> None:
     parsed = parse_boot_time("2026-10-21 21:26:30\n")
     expected = datetime.fromisoformat("2026-10-21 21:26:30").astimezone().timestamp()
     assert parsed == expected
+
+
+def test_parse_cgroup_cpu_values() -> None:
+    assert parse_cgroup_cpu_max("200000 100000\n") == 2.0
+    assert parse_cgroup_cpu_max("max 100000\n") is None
+    with pytest.raises(MetricUnavailable):
+        parse_cgroup_cpu_max("bad")
+    with pytest.raises(MetricUnavailable):
+        parse_cgroup_cpu_max("0 100000")
+
+    assert parse_cgroup_cpu_usage("usage_usec 1234\nnr_periods 10\n") == 1234
+    assert parse_cgroup_cpu_usage("nr_periods 10\n") is None
+    with pytest.raises(MetricUnavailable):
+        parse_cgroup_cpu_usage("usage_usec nope\n")
+
+
+def test_parse_cgroup_memory_values() -> None:
+    assert parse_cgroup_memory_limit("1073741824\n") == 1073741824
+    assert parse_cgroup_memory_limit("max\n") is None
+    assert parse_cgroup_memory_limit("0\n") is None
+    with pytest.raises(MetricUnavailable):
+        parse_cgroup_memory_limit("nope")
+
+    assert parse_cgroup_memory_current("4096\n") == 4096
+    with pytest.raises(MetricUnavailable):
+        parse_cgroup_memory_current("-1\n")
 
 
 def test_parse_df_k() -> None:
@@ -346,6 +379,102 @@ def test_collector_uses_command_fallbacks(tmp_path: Path) -> None:
     assert snapshot.warnings == ()
 
 
+def test_frozen_uptime_is_extrapolated(tmp_path: Path) -> None:
+    uptime_path = tmp_path / "uptime"
+    uptime_path.write_text("124.08 932.76\n")
+    times = iter([100.0, 110.0, 120.0, 130.0])
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        cpu_sample_seconds=0,
+        monotonic=lambda: next(times),
+    )
+    warnings: list[str] = []
+
+    first = collector._collect_uptime(warnings)
+    second = collector._collect_uptime(warnings)
+    assert first is not None and second is not None
+    assert first.seconds == 124.08
+    assert first.source == "/proc/uptime"
+    assert second.seconds == pytest.approx(134.08)
+    assert second.source == "/proc/uptime (extrapolated)"
+
+    uptime_path.write_text("144.08 932.76\n")
+    third = collector._collect_uptime(warnings)
+    assert third is not None
+    assert third.seconds == 144.08
+    assert third.source == "/proc/uptime"
+
+    uptime_path.write_text("5.00 932.76\n")
+    fourth = collector._collect_uptime(warnings)
+    assert fourth is not None
+    assert fourth.seconds == 5.0
+    assert fourth.source == "/proc/uptime"
+    assert warnings == []
+
+
+def test_collector_uses_cgroup_cpu_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cpu.max").write_text("200000 100000\n")
+    (cgroup / "cpu.stat").write_text("usage_usec 0\n")
+
+    def advance(seconds: float) -> None:
+        (cgroup / "cpu.stat").write_text("usage_usec 4000000\n")
+
+    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 8)
+    times = iter([100.0, 102.0])
+    collector = SystemCollector(
+        proc_root=tmp_path / "proc",
+        cgroup_root=cgroup,
+        cpu_sample_seconds=0.01,
+        sleep=advance,
+        monotonic=lambda: next(times),
+    )
+
+    assert collector._effective_cpu_cores() == 2
+    usage, source = collector._sample_cpu_usage()
+    assert usage == pytest.approx(100.0)
+    assert source == "cgroup v2"
+
+
+def test_collector_uses_cgroup_memory(tmp_path: Path) -> None:
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.max").write_text("4294967296\n")
+    (cgroup / "memory.current").write_text("1073741824\n")
+    (cgroup / "memory.swap.max").write_text("2147483648\n")
+    (cgroup / "memory.swap.current").write_text("536870912\n")
+
+    collector = SystemCollector(
+        proc_root=tmp_path / "proc",
+        cgroup_root=cgroup,
+        cpu_sample_seconds=0,
+    )
+    memory = collector._collect_memory([])
+
+    assert memory is not None
+    assert memory.total_bytes == 4 * 1024**3
+    assert memory.used_bytes == 1 * 1024**3
+    assert memory.available_bytes == 3 * 1024**3
+    assert memory.free_bytes == 3 * 1024**3
+    assert memory.swap_total_bytes == 2 * 1024**3
+    assert memory.swap_used_bytes == 512 * 1024**2
+    assert memory.source == "cgroup v2"
+
+
+def test_cgroup_path_uses_current_scope(tmp_path: Path) -> None:
+    scoped = tmp_path / "cgroup" / "uid_1000" / "pid_42"
+    scoped.mkdir(parents=True)
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("0::/uid_1000/pid_42\n")
+
+    collector = SystemCollector(proc_root=proc, cgroup_root=tmp_path / "cgroup")
+    assert collector._cgroup_dir() == scoped
+
+
 def test_collector_missing_proc_and_utilities_is_graceful(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -426,6 +555,21 @@ def test_process_cpu_usage_calculation() -> None:
     )
 
 
+def test_process_cpu_rates_calculation() -> None:
+    rates = calculate_process_cpu_rates(
+        {1: 100, 2: 50, 3: 10},
+        {1: 300, 2: 50, 4: 999},
+        elapsed=2.0,
+        clock_ticks=100,
+    )
+    assert rates[1] == pytest.approx(100.0)
+    assert rates[2] == pytest.approx(0.0)
+    assert 3 not in rates
+    assert 4 not in rates
+    assert calculate_process_cpu_rates(None, {1: 300}, 2.0) == {}
+    assert calculate_process_cpu_rates({1: 0}, {1: 300}, 0.0) == {}
+
+
 def test_static_proc_stat_falls_back_to_process_cpu_times(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -469,6 +613,43 @@ def test_process_cpu_fallback_when_proc_stat_is_missing(
     usage, source = collector._sample_cpu_usage()
     assert usage == pytest.approx(100.0)
     assert source == "/proc/[pid]/stat"
+
+
+def test_detailed_cpu_sampling_feeds_live_top_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "loadavg").write_text("0.10 0.20 0.30 1/100 42\n")
+    write_proc_cpu_times(tmp_path, 100, utime=0, stime=0)
+    write_proc_cpu_times(tmp_path, 200, utime=50, stime=0)
+
+    def advance(seconds: float) -> None:
+        write_proc_cpu_times(tmp_path, 100, utime=200, stime=0)
+        write_proc_cpu_times(tmp_path, 200, utime=50, stime=0)
+
+    monkeypatch.setattr(collectors.os, "cpu_count", lambda: 4)
+    times = iter([100.0, 102.0])
+    collector = SystemCollector(
+        proc_root=tmp_path,
+        cgroup_root=tmp_path / "no-cgroup",
+        cpu_sample_seconds=0.01,
+        sleep=advance,
+        monotonic=lambda: next(times),
+    )
+
+    cpu = collector._collect_cpu([], detailed=True)
+    assert cpu.cores == 4
+    assert cpu.usage_percent == pytest.approx(25.0)
+    assert cpu.source == "/proc/loadavg + /proc/[pid]/stat"
+    assert collector._process_cpu_rates[100] == pytest.approx(100.0)
+    assert collector._process_cpu_rates[200] == 0.0
+
+    processes = collector._collect_processes([])
+    assert processes.source == "/proc"
+    assert processes.running == 2
+    assert processes.total == 2
+    assert [process.pid for process in processes.top] == [100, 200]
+    assert processes.top[0].command == "worker"
+    assert processes.top[0].cpu_percent == pytest.approx(100.0)
 
 
 def test_process_counts_and_proc_fallback_top(tmp_path: Path) -> None:

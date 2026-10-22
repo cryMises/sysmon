@@ -133,7 +133,7 @@ def _cpu_panel(
     )
     table.add_row(
         Text("cores", style="dim"),
-        Text(str(cpu.cores) if cpu.cores else "n/a"),
+        Text(f"{cpu.cores:g}" if cpu.cores else "n/a"),
     )
     return _panel("CPU", table, "cyan", cpu.source)
 

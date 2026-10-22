@@ -20,7 +20,7 @@ class LoadAverage:
 class CpuStats:
     load: LoadAverage = LoadAverage()
     usage_percent: float | None = None
-    cores: int | None = None
+    cores: float | None = None
     source: str = "unavailable"
 
     def to_dict(self) -> dict[str, Any]:

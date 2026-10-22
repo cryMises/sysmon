@@ -200,7 +200,7 @@ def calculate_process_cpu_usage(
     before: Mapping[int, int] | None,
     after: Mapping[int, int] | None,
     elapsed: float,
-    cores: int | None,
+    cores: float | None,
     clock_ticks: int = 100,
 ) -> float | None:
     """Estimate CPU usage from per-process utime/stime deltas.
@@ -227,6 +227,29 @@ def calculate_process_cpu_usage(
     delta_ticks = sum(max(0, after[pid] - before[pid]) for pid in common_pids)
     usage = delta_ticks / clock_ticks / elapsed / cores * 100.0
     return max(0.0, min(100.0, usage))
+
+
+def calculate_process_cpu_rates(
+    before: Mapping[int, int] | None,
+    after: Mapping[int, int] | None,
+    elapsed: float,
+    clock_ticks: int = 100,
+) -> dict[int, float]:
+    """Return per-PID CPU percentages for processes present in both samples.
+
+    Values are relative to one CPU core, matching the convention used by
+    ``ps`` and ``top``; a busy multi-threaded process can exceed 100%.
+    """
+
+    if not before or not after or elapsed <= 0 or clock_ticks <= 0:
+        return {}
+    common_pids = set(before).intersection(after)
+    if not common_pids:
+        return {}
+    return {
+        pid: max(0.0, after[pid] - before[pid]) / clock_ticks / elapsed * 100.0
+        for pid in common_pids
+    }
 
 
 def _clock_ticks() -> int:
@@ -301,6 +324,68 @@ def parse_os_release(text: str) -> str | None:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip("\"'")
     return values.get("PRETTY_NAME") or values.get("NAME") or None
+
+
+def parse_cgroup_cpu_max(text: str) -> float | None:
+    """Parse a cgroup v2 ``cpu.max`` quota into an effective core count.
+
+    Returns ``None`` when the quota is unlimited (``max``).
+    """
+
+    fields = text.split()
+    if len(fields) < 2:
+        raise MetricUnavailable("invalid cgroup cpu.max")
+    quota, period = fields[0], fields[1]
+    if quota == "max":
+        return None
+    try:
+        quota_value = int(quota)
+        period_value = int(period)
+    except ValueError as exc:
+        raise MetricUnavailable("invalid cgroup cpu.max") from exc
+    if quota_value <= 0 or period_value <= 0:
+        raise MetricUnavailable("invalid cgroup cpu.max")
+    return quota_value / period_value
+
+
+def parse_cgroup_cpu_usage(text: str) -> int | None:
+    """Return ``usage_usec`` from a cgroup v2 ``cpu.stat`` file."""
+
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] != "usage_usec":
+            continue
+        try:
+            return max(0, int(fields[1]))
+        except ValueError as exc:
+            raise MetricUnavailable("invalid cgroup cpu.stat") from exc
+    return None
+
+
+def parse_cgroup_memory_limit(text: str) -> int | None:
+    """Parse a cgroup v2 memory limit; ``None`` means unlimited."""
+
+    raw = text.strip()
+    if not raw or raw == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise MetricUnavailable("invalid cgroup memory limit") from exc
+    return value if value > 0 else None
+
+
+def parse_cgroup_memory_current(text: str) -> int:
+    """Parse a cgroup v2 current-usage value in bytes."""
+
+    raw = text.strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise MetricUnavailable("invalid cgroup memory usage") from exc
+    if value < 0:
+        raise MetricUnavailable("invalid cgroup memory usage")
+    return value
 
 
 def _network_stats_from_entries(
@@ -515,6 +600,7 @@ class SystemCollector:
         proc_root: Path = Path("/proc"),
         sysfs_net: Path = Path("/sys/class/net"),
         android_service: Path = Path("/system/bin/service"),
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
         os_release: Path = Path("/etc/os-release"),
         cpu_sample_seconds: float = 0.12,
         command_timeout: float = 2.0,
@@ -527,6 +613,7 @@ class SystemCollector:
         self.proc_root = Path(proc_root)
         self.sysfs_net = Path(sysfs_net)
         self.android_service = Path(android_service)
+        self.cgroup_root = Path(cgroup_root)
         self.os_release = Path(os_release)
         self.cpu_sample_seconds = max(0.0, cpu_sample_seconds)
         self.command_timeout = command_timeout
@@ -535,10 +622,13 @@ class SystemCollector:
         self.sleep = sleep
         self.monotonic = monotonic
         self._last_network: tuple[float, int, int, str] | None = None
+        self._last_uptime: tuple[float, float, float, str] | None = None
+        self._last_process_sample: tuple[float, dict[int, int]] | None = None
+        self._process_cpu_rates: dict[int, float] = {}
 
     def collect(self, detailed: bool = False) -> Snapshot:
         warnings: list[str] = []
-        cpu = self._collect_cpu(warnings)
+        cpu = self._collect_cpu(warnings, detailed=detailed)
         memory = self._collect_memory(warnings)
         disks = self._collect_disks(warnings)
         uptime = self._collect_uptime(warnings)
@@ -559,7 +649,9 @@ class SystemCollector:
             machine=platform.machine().strip() or "unknown",
         )
 
-    def _collect_cpu(self, warnings: list[str]) -> CpuStats:
+    def _collect_cpu(
+        self, warnings: list[str], *, detailed: bool = False
+    ) -> CpuStats:
         load = LoadAverage()
         load_source: str | None = None
         load_error: str | None = None
@@ -568,11 +660,14 @@ class SystemCollector:
         except MetricUnavailable as exc:
             load_error = str(exc)
 
+        cores = self._effective_cpu_cores()
         usage: float | None = None
         usage_source: str | None = None
         usage_error: str | None = None
         try:
-            usage, usage_source = self._sample_cpu_usage()
+            usage, usage_source = self._sample_cpu_usage(
+                cores=cores, detailed=detailed
+            )
         except (OSError, ValueError, MetricUnavailable) as exc:
             usage_error = str(exc)
 
@@ -589,7 +684,7 @@ class SystemCollector:
         return CpuStats(
             load=load,
             usage_percent=usage,
-            cores=os.cpu_count(),
+            cores=cores,
             source=" + ".join(sources) if sources else "unavailable",
         )
 
@@ -610,17 +705,74 @@ class SystemCollector:
             ) from exc
         return LoadAverage(one=one, five=five, fifteen=fifteen), "os.getloadavg"
 
-    def _sample_cpu_usage(self) -> tuple[float | None, str | None]:
-        """Sample CPU usage, falling back to process CPU-time deltas.
+    def _effective_cpu_cores(self) -> float | None:
+        """Return host cores, capped by a finite cgroup CPU quota."""
 
-        Some containers (notably PRoot on Android) expose a static
-        ``/proc/stat``. In that case per-process ``utime``/``stime`` counters
-        still advance, so their delta is used before falling back to the
-        average since boot.
+        host = os.cpu_count()
+        try:
+            limit = parse_cgroup_cpu_max(
+                _read_text(self._cgroup_dir() / "cpu.max")
+            )
+        except (OSError, ValueError, MetricUnavailable):
+            limit = None
+        if limit is None:
+            return host
+        if host:
+            limit = min(limit, float(host))
+        value = max(0.01, round(limit, 2))
+        return int(value) if value.is_integer() else value
+
+    def _cgroup_dir(self) -> Path:
+        """Resolve the current cgroup v2 directory, falling back to the root."""
+
+        try:
+            content = _read_text(self.proc_root / "self" / "cgroup")
+        except OSError:
+            return self.cgroup_root
+
+        for line in content.splitlines():
+            fields = line.split(":", 2)
+            if len(fields) != 3 or fields[0] != "0":
+                continue
+            relative = fields[2].strip()
+            if not relative:
+                continue
+            candidate = self.cgroup_root / relative.lstrip("/")
+            try:
+                if candidate.is_dir():
+                    return candidate
+            except OSError:
+                continue
+        return self.cgroup_root
+
+    def _read_cgroup_cpu_usage(self, cgroup_dir: Path) -> int | None:
+        try:
+            return parse_cgroup_cpu_usage(_read_text(cgroup_dir / "cpu.stat"))
+        except (OSError, ValueError, MetricUnavailable):
+            return None
+
+    def _sample_cpu_usage(
+        self,
+        cores: float | None = None,
+        *,
+        detailed: bool = False,
+    ) -> tuple[float | None, str | None]:
+        """Sample CPU usage, preferring cgroup limits and process deltas.
+
+        A readable cgroup v2 ``cpu.stat`` is the most accurate source inside a
+        container. Otherwise ``/proc/stat`` is used; if those counters are
+        frozen (notably under PRoot on Android), per-process ``utime``/``stime``
+        deltas are summed before falling back to the average since boot.
         """
 
+        self._process_cpu_rates = {}
         if self.cpu_sample_seconds <= 0:
             return None, None
+        if cores is None:
+            cores = self._effective_cpu_cores()
+
+        cgroup_dir = self._cgroup_dir()
+        cgroup_before = self._read_cgroup_cpu_usage(cgroup_dir)
         stat_path = self.proc_root / "stat"
         stat_error: Exception | None = None
         before: CpuTimes | None = None
@@ -633,6 +785,30 @@ class SystemCollector:
         started = self.monotonic()
         self.sleep(self.cpu_sample_seconds)
         elapsed = self.monotonic() - started
+        sample_end = started + elapsed
+
+        cgroup_after = self._read_cgroup_cpu_usage(cgroup_dir)
+        if (
+            cgroup_before is not None
+            and cgroup_after is not None
+            and cgroup_after >= cgroup_before
+            and elapsed > 0
+        ):
+            usage = (
+                (cgroup_after - cgroup_before)
+                / 1_000_000.0
+                / elapsed
+                / max(cores or 1.0, 0.01)
+                * 100.0
+            )
+            if detailed:
+                self._record_process_cpu_rates(
+                    process_before,
+                    self._read_process_cpu_ticks(),
+                    elapsed,
+                    sample_end,
+                )
+            return max(0.0, min(100.0, usage)), "cgroup v2"
 
         after: CpuTimes | None = None
         if before is not None:
@@ -644,14 +820,25 @@ class SystemCollector:
         if before is not None and after is not None:
             usage = calculate_cpu_usage(before, after)
             if usage is not None:
+                if detailed:
+                    self._record_process_cpu_rates(
+                        process_before,
+                        self._read_process_cpu_ticks(),
+                        elapsed,
+                        sample_end,
+                    )
                 return usage, "/proc/stat"
 
         process_after = self._read_process_cpu_ticks()
+        if detailed:
+            self._record_process_cpu_rates(
+                process_before, process_after, elapsed, sample_end
+            )
         usage = calculate_process_cpu_usage(
             process_before,
             process_after,
             elapsed,
-            os.cpu_count(),
+            cores,
             _clock_ticks(),
         )
         if usage is not None:
@@ -665,6 +852,32 @@ class SystemCollector:
         if stat_error is not None:
             raise MetricUnavailable(f"/proc/stat unavailable ({stat_error})")
         return None, None
+
+    def _record_process_cpu_rates(
+        self,
+        before: Mapping[int, int] | None,
+        after: Mapping[int, int] | None,
+        elapsed: float,
+        sample_end: float,
+    ) -> None:
+        """Store per-PID CPU rates, blending the previous watch sample."""
+
+        if not after:
+            return
+        clock_ticks = _clock_ticks()
+        rates = calculate_process_cpu_rates(before, after, elapsed, clock_ticks)
+        if self._last_process_sample is not None:
+            previous_time, previous_ticks = self._last_process_sample
+            rates.update(
+                calculate_process_cpu_rates(
+                    previous_ticks,
+                    after,
+                    sample_end - previous_time,
+                    clock_ticks,
+                )
+            )
+        self._process_cpu_rates = rates
+        self._last_process_sample = (sample_end, after)
 
     def _read_process_cpu_ticks(self) -> dict[int, int] | None:
         """Sum utime+stime for every readable process, keyed by PID."""
@@ -691,6 +904,10 @@ class SystemCollector:
         return ticks or None
 
     def _collect_memory(self, warnings: list[str]) -> MemoryStats | None:
+        cgroup_memory = self._memory_from_cgroup()
+        if cgroup_memory is not None:
+            return cgroup_memory
+
         try:
             return parse_meminfo(_read_text(self.proc_root / "meminfo"))
         except (OSError, ValueError, MetricUnavailable) as proc_exc:
@@ -701,6 +918,48 @@ class SystemCollector:
                     f"Memory: /proc/meminfo unavailable ({proc_exc}); {free_exc}"
                 )
                 return None
+
+    def _memory_from_cgroup(self) -> MemoryStats | None:
+        """Use a finite cgroup v2 memory limit when one is readable."""
+
+        cgroup_dir = self._cgroup_dir()
+        try:
+            total = parse_cgroup_memory_limit(
+                _read_text(cgroup_dir / "memory.max")
+            )
+            current = parse_cgroup_memory_current(
+                _read_text(cgroup_dir / "memory.current")
+            )
+        except (OSError, ValueError, MetricUnavailable):
+            return None
+        if total is None or current is None:
+            return None
+
+        used = min(current, total)
+        swap_total = 0
+        swap_used = 0
+        try:
+            swap_limit = parse_cgroup_memory_limit(
+                _read_text(cgroup_dir / "memory.swap.max")
+            )
+            swap_current = parse_cgroup_memory_current(
+                _read_text(cgroup_dir / "memory.swap.current")
+            )
+            if swap_limit is not None:
+                swap_total = swap_limit
+                swap_used = min(swap_current, swap_limit)
+        except (OSError, ValueError, MetricUnavailable):
+            pass
+
+        return MemoryStats(
+            total_bytes=total,
+            used_bytes=used,
+            available_bytes=total - used,
+            free_bytes=total - used,
+            swap_total_bytes=swap_total,
+            swap_used_bytes=swap_used,
+            source="cgroup v2",
+        )
 
     def _collect_disks(self, warnings: list[str]) -> tuple[DiskStats, ...]:
         disks: list[DiskStats] = []
@@ -729,21 +988,47 @@ class SystemCollector:
                 )
                 return None
 
+    def _track_uptime(self, raw_seconds: float, source: str) -> tuple[float, str]:
+        """Advance a frozen uptime counter using monotonic elapsed time."""
+
+        now = self.monotonic()
+        previous = self._last_uptime
+        extrapolated = False
+        if previous is None or previous[3] != source:
+            seconds = raw_seconds
+        else:
+            previous_time, previous_raw, previous_seconds, _ = previous
+            elapsed = max(0.0, now - previous_time)
+            if raw_seconds < previous_raw - 1.0:
+                # A reboot or namespace change restarts the counter.
+                seconds = raw_seconds
+            elif raw_seconds > previous_raw:
+                # Normal progress; never move backwards after extrapolation.
+                seconds = max(raw_seconds, previous_seconds)
+            elif elapsed > 0:
+                seconds = previous_seconds + elapsed
+                extrapolated = True
+            else:
+                seconds = previous_seconds
+
+        self._last_uptime = (now, raw_seconds, seconds, source)
+        label = f"{source} (extrapolated)" if extrapolated else source
+        return seconds, label
+
     def _collect_uptime(self, warnings: list[str]) -> UptimeStats | None:
         proc_error: Exception | None = None
         try:
-            return UptimeStats(
-                seconds=parse_uptime(_read_text(self.proc_root / "uptime")),
-                source="/proc/uptime",
-            )
+            raw_seconds = parse_uptime(_read_text(self.proc_root / "uptime"))
+            seconds, source = self._track_uptime(raw_seconds, "/proc/uptime")
+            return UptimeStats(seconds=seconds, source=source)
         except (OSError, ValueError, MetricUnavailable) as exc:
             proc_error = exc
 
         try:
             booted = parse_boot_time(self._run(("uptime", "-s")))
-            return UptimeStats(
-                seconds=max(0.0, self.clock() - booted), source="uptime -s"
-            )
+            raw_seconds = max(0.0, self.clock() - booted)
+            seconds, source = self._track_uptime(raw_seconds, "uptime -s")
+            return UptimeStats(seconds=seconds, source=source)
         except MetricUnavailable as exc:
             warnings.append(
                 f"Uptime: /proc/uptime unavailable ({proc_error}); {exc}"
@@ -865,19 +1150,25 @@ class SystemCollector:
         return running, total
 
     def _read_top_processes(self) -> tuple[tuple[ProcessInfo, ...], str]:
-        ps_error: Exception | None = None
+        errors: list[str] = []
+        if self._process_cpu_rates:
+            try:
+                return self._top_processes_from_proc(), "/proc"
+            except (OSError, ValueError, MetricUnavailable) as exc:
+                errors.append(f"/proc unavailable ({exc})")
+
         try:
             output = self._run(("ps", "-eo", "pid=,pcpu=,rss=,comm="))
             return parse_ps_processes(output), "ps"
         except MetricUnavailable as exc:
-            ps_error = exc
+            errors.append(f"ps unavailable ({exc})")
 
         try:
             return self._top_processes_from_proc(), "/proc"
         except (OSError, ValueError, MetricUnavailable) as exc:
-            raise MetricUnavailable(
-                f"ps unavailable ({ps_error}); /proc scan failed ({exc})"
-            ) from exc
+            errors.append(f"/proc scan failed ({exc})")
+
+        raise MetricUnavailable("; ".join(errors))
 
     def _top_processes_from_proc(self) -> tuple[ProcessInfo, ...]:
         try:
@@ -905,13 +1196,20 @@ class SystemCollector:
                 ProcessInfo(
                     pid=pid,
                     command=command or f"[{pid}]",
+                    cpu_percent=self._process_cpu_rates.get(pid),
                     memory_bytes=resident_pages * page_size,
                 )
             )
 
         if not processes:
             raise MetricUnavailable("/proc contains no readable process data")
-        processes.sort(key=lambda process: process.memory_bytes or 0, reverse=True)
+        processes.sort(
+            key=lambda process: (
+                process.cpu_percent if process.cpu_percent is not None else -1.0,
+                process.memory_bytes or 0,
+            ),
+            reverse=True,
+        )
         return tuple(processes[:MAX_TOP_PROCESSES])
 
     def _run(self, args: Sequence[str]) -> str:
