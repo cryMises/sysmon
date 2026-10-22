@@ -133,11 +133,12 @@ def _header(snapshot: Snapshot) -> Group:
     grid.add_column(justify="right", no_wrap=True)
     grid.add_row(title, timestamp)
 
-    context = Text(
-        f"{snapshot.hostname} · {snapshot.os_name} · {snapshot.machine}",
-        style="dim",
-        no_wrap=True,
+    context = Text.assemble(
+        (snapshot.hostname, "bold"),
+        (" · ", "dim"),
+        (f"{snapshot.os_name} · {snapshot.machine}", "dim"),
         overflow="ellipsis",
+        no_wrap=True,
     )
     return Group(grid, context)
 
@@ -314,7 +315,6 @@ def _battery_panel(
     if battery is None or not battery.present:
         return None
 
-    details: list[Text] = []
     state = " · ".join(
         label
         for label in (
@@ -323,8 +323,6 @@ def _battery_panel(
         )
         if label
     )
-    if state:
-        details.append(Text(state, style="bold"))
 
     meta: list[str] = []
     if battery.temperature_c is not None:
@@ -334,30 +332,20 @@ def _battery_panel(
         meta.append(health)
     if battery.technology:
         meta.append(battery.technology)
-    if meta:
-        details.append(Text(" · ".join(meta), style="dim"))
-
-    energy: list[str] = []
     if battery.power_w is not None:
-        energy.append(f"{battery.power_w:.2f} W")
+        meta.append(f"{battery.power_w:.2f} W")
     if battery.time_remaining_seconds is not None:
-        energy.append(
-            f"~{format_duration(battery.time_remaining_seconds)} left"
-        )
+        meta.append(f"~{format_duration(battery.time_remaining_seconds)} left")
     if (
         battery.cache_age_seconds is not None
         and battery.cache_age_seconds >= 1.0
     ):
-        energy.append(f"cached {format_duration(battery.cache_age_seconds)} ago")
-    if energy:
-        details.append(Text(" · ".join(energy), style="dim"))
-    if not details:
-        details.append(Text("Battery details unavailable", style="dim"))
+        meta.append(f"cached {format_duration(battery.cache_age_seconds)} ago")
 
-    table = Table.grid(expand=True, padding=(0, 2))
-    table.add_column(no_wrap=True)
-    table.add_column(ratio=1)
-    table.add_row(
+    head = Table.grid(expand=True, padding=(0, 2))
+    head.add_column(no_wrap=True)
+    head.add_column(ratio=1)
+    head.add_row(
         _meter(
             battery.percentage,
             bar_width,
@@ -366,9 +354,16 @@ def _battery_panel(
             critical=threshold.critical,
             inverted=True,
         ),
-        Group(*details),
+        Text(state, style="bold", overflow="fold"),
     )
-    return _panel("Battery", table, "bright_green", battery.source)
+
+    body: list[RenderableType] = [head]
+    if meta:
+        body.append(Text(" · ".join(meta), style="dim", overflow="fold"))
+    elif not state:
+        body.append(Text("Battery details unavailable", style="dim"))
+
+    return _panel("Battery", Group(*body), "bright_green", battery.source)
 
 
 def _battery_label(value: str | None) -> str | None:
@@ -739,8 +734,7 @@ def _footer(
 ) -> Text:
     if not live:
         return Text(
-            "Run with --watch for live updates  ·  "
-            "--json for machine-readable output",
+            "Run with --watch for live updates  ·  --json for JSON",
             style="dim",
             overflow="fold",
         )
@@ -816,7 +810,7 @@ def _meter(
     line.append(full * filled, style=style)
     line.append(empty * (width - filled), style="grey37")
     line.append(" ")
-    line.append(format_percent(percent), style=style)
+    line.append(format_percent(percent).rjust(6), style=f"{style} bold")
     return line
 
 

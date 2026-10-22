@@ -201,28 +201,27 @@ On standard Linux, network accounting uses `/proc/net/dev`. Android denies unpri
 The layout below is from this workspace at 100 columns. In this PRoot environment `/proc/stat` counters are static, so CPU usage is derived from per-process CPU time and labelled accordingly. `/proc/net/dev` is blocked, so the Network panel uses Android's `netstats` service.
 
 ```text
-sysmon  system monitor                                                           2026-10-22 11:59:08
+sysmon  system monitor                                                           2026-10-22 14:39:11
 localhost · Ubuntu 26.04.1 LTS · aarch64
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ╭─ CPU ─────────────────────────────────────────╮ ╭─ Memory ───────────────────────────────────────╮
-│ load 1/5/15 0.12 / 0.07 / 0.02                │ │ RAM   █████████░░░░░░░ 55.5%                   │
-│ usage       ███░░░░░░░░░░░░░ 19.6%            │ │       6.1 GiB used / 11.1 GiB total            │
-│ cores       8                                 │ │ SWAP  ████████░░░░░░░░ 51.1%                   │
-│ CPU 0-3     1.30 GHz / 2.20 GHz max           │ │       4.1 GiB used / 8.0 GiB total             │
-│ CPU 4-6     900 MHz / 3.20 GHz max            │ ╰─ src: /proc/meminfo ───────────────────────────╯
-│ CPU 7       400 MHz / 3.35 GHz max            │                                                    │
-╰─ src: /proc/loadavg + /proc/[pid]/stat ───────╯                                                    │
+│ load 1/5/15 0.12 / 0.07 / 0.02                │ │ RAM   ██████████░░░░░░  60.8%                  │
+│ usage       ██░░░░░░░░░░░░░░  11.3%           │ │       6.7 GiB used / 11.1 GiB total            │
+│ cores       8                                 │ │ SWAP  ███████████░░░░░  67.0%                  │
+│ CPU 0-3     480 MHz / 2.20 GHz max            │ │       5.4 GiB used / 8.0 GiB total             │
+│ CPU 4-6     2.20 GHz / 3.20 GHz max           │ ╰─ src: /proc/meminfo ───────────────────────────╯
+│ CPU 7       400 MHz / 3.35 GHz max            │
+╰─ src: /proc/loadavg + /proc/[pid]/stat ───────╯
 ╭─ Disk ────────────────────────────────────────╮ ╭─ Uptime ───────────────────────────────────────╮
 │ /                                             │ │ 2m 4s                                          │
-│ █████░░░░░░░░░░░ 31.6%                        │ │ booted 2026-10-22 11:57                        │
-│ 146.9 GiB / 465.4 GiB used · 318.0 GiB free   │ ╰─ src: /proc/uptime ────────────────────────────╯
-╰─ src: statvfs ────────────────────────────────╯                                                    │
+│ █████░░░░░░░░░░░  31.8%                       │ │ booted 2026-10-22 14:37                        │
+│ 148.1 GiB / 465.4 GiB used · 316.8 GiB free   │ ╰─ src: /proc/uptime ────────────────────────────╯
+╰─ src: statvfs ────────────────────────────────╯
 ╭─ Battery ────────────────────────────────────────────────────────────────────────────────────────╮
-│ █████████████░░░ 81.0%  Discharging · Unplugged                                                  │
-│                         38.7°C · Good · Li-poly                                                  │
-│                         2.30 W · ~6h 38m left                                                    │
+│ ████████░░░░░░░░  49.0%  Discharging · Unplugged                                                 │
+│ 33.9°C · Good · Li-poly · 2.17 W · ~3h 50m left                                                  │
 ╰─ src: termux-battery-status ─────────────────────────────────────────────────────────────────────╯
-Run with --watch for live updates  ·  --json for machine-readable output
+Run with --watch for live updates  ·  --json for JSON
 ```
 
 On a narrow terminal the panels stack vertically.
