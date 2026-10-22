@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from sysmon.models import (
@@ -9,6 +11,9 @@ from sysmon.models import (
     DiskStats,
     LoadAverage,
     MemoryStats,
+    NetworkStats,
+    ProcessInfo,
+    ProcessStats,
     Snapshot,
     UptimeStats,
 )
@@ -45,8 +50,44 @@ def sample_snapshot() -> Snapshot:
             ),
         ),
         uptime=UptimeStats(seconds=90_061, source="/proc/uptime"),
+        network=None,
+        processes=None,
         warnings=(),
         hostname="termux",
         os_name="Ubuntu 26.04.1 LTS",
         machine="aarch64",
+    )
+
+
+@pytest.fixture
+def live_snapshot(sample_snapshot: Snapshot) -> Snapshot:
+    return replace(
+        sample_snapshot,
+        network=NetworkStats(
+            rx_bytes=5 * GIB,
+            tx_bytes=2 * GIB,
+            rx_rate=1536.0,
+            tx_rate=512.0,
+            interfaces=2,
+            source="/proc/net/dev",
+        ),
+        processes=ProcessStats(
+            total=42,
+            running=2,
+            top=(
+                ProcessInfo(
+                    pid=1234,
+                    command="python",
+                    cpu_percent=12.5,
+                    memory_bytes=512 * 1024**2,
+                ),
+                ProcessInfo(
+                    pid=5678,
+                    command="bash",
+                    cpu_percent=1.0,
+                    memory_bytes=64 * 1024**2,
+                ),
+            ),
+            source="ps",
+        ),
     )

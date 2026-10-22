@@ -53,3 +53,11 @@ def format_percent(value: float | None, digits: int = 1) -> str:
 
 def format_load(value: float | None) -> str:
     return "n/a" if value is None or not math.isfinite(value) else f"{value:.2f}"
+
+
+def format_rate(value: float | None) -> str:
+    """Format a bytes-per-second rate."""
+
+    if value is None or not math.isfinite(value):
+        return "n/a"
+    return f"{format_bytes(value)}/s"

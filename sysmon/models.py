@@ -104,6 +104,58 @@ class UptimeStats:
 
 
 @dataclass(frozen=True)
+class NetworkStats:
+    rx_bytes: int
+    tx_bytes: int
+    rx_rate: float | None = None
+    tx_rate: float | None = None
+    interfaces: int = 0
+    source: str = "unavailable"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rx_bytes": self.rx_bytes,
+            "tx_bytes": self.tx_bytes,
+            "rx_bytes_per_sec": _rounded(self.rx_rate),
+            "tx_bytes_per_sec": _rounded(self.tx_rate),
+            "interfaces": self.interfaces,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    command: str
+    cpu_percent: float | None = None
+    memory_bytes: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "command": self.command,
+            "cpu_percent": _rounded(self.cpu_percent),
+            "memory_bytes": self.memory_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class ProcessStats:
+    total: int | None = None
+    running: int | None = None
+    top: tuple[ProcessInfo, ...] = ()
+    source: str = "unavailable"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "running": self.running,
+            "top": [process.to_dict() for process in self.top],
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """A complete, immutable sample of the host."""
 
@@ -112,13 +164,15 @@ class Snapshot:
     memory: MemoryStats | None
     disks: tuple[DiskStats, ...]
     uptime: UptimeStats | None
+    network: NetworkStats | None
+    processes: ProcessStats | None
     warnings: tuple[str, ...]
     hostname: str
     os_name: str
     machine: str
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(self.timestamp)
             .astimezone()
             .isoformat(timespec="seconds"),
@@ -129,8 +183,11 @@ class Snapshot:
             "memory": self.memory.to_dict() if self.memory else None,
             "disks": [disk.to_dict() for disk in self.disks],
             "uptime": self.uptime.to_dict(self.timestamp) if self.uptime else None,
+            "network": self.network.to_dict() if self.network else None,
+            "processes": self.processes.to_dict() if self.processes else None,
             "warnings": list(self.warnings),
         }
+        return data
 
 
 def _percent(used: int | None, total: int | None) -> float | None:

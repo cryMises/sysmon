@@ -13,8 +13,10 @@ from sysmon.models import Snapshot
 class FakeCollector:
     def __init__(self, snapshot: Snapshot) -> None:
         self.snapshot = snapshot
+        self.detailed_calls: list[bool] = []
 
-    def collect(self) -> Snapshot:
+    def collect(self, detailed: bool = False) -> Snapshot:
+        self.detailed_calls.append(detailed)
         return self.snapshot
 
 
@@ -25,7 +27,9 @@ def install_fake_collector(
 
     def factory(**kwargs: Any) -> FakeCollector:
         captured.update(kwargs)
-        return FakeCollector(snapshot)
+        collector = FakeCollector(snapshot)
+        captured["collector"] = collector
+        return collector
 
     monkeypatch.setattr(cli, "SystemCollector", factory)
     return captured
@@ -49,7 +53,7 @@ def test_json_output_is_machine_readable(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    install_fake_collector(monkeypatch, sample_snapshot)
+    captured = install_fake_collector(monkeypatch, sample_snapshot)
     assert cli.main(["--json"]) == 0
     data = json.loads(capsys.readouterr().out)
 
@@ -59,7 +63,26 @@ def test_json_output_is_machine_readable(
     assert data["memory"]["used_percent"] == 37.5
     assert data["disks"][0]["used_percent"] == 42.0
     assert data["uptime"]["seconds"] == 90_061.0
+    assert data["network"] is None
+    assert data["processes"] is None
     assert data["warnings"] == []
+    assert captured["collector"].detailed_calls == [True]
+
+
+def test_json_includes_live_metrics(
+    live_snapshot: Snapshot,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_fake_collector(monkeypatch, live_snapshot)
+    assert cli.main(["--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+
+    assert data["network"]["rx_bytes_per_sec"] == 1536.0
+    assert data["network"]["interfaces"] == 2
+    assert data["processes"]["running"] == 2
+    assert data["processes"]["top"][0]["command"] == "python"
+    assert data["processes"]["top"][0]["cpu_percent"] == 12.5
 
 
 def test_json_rejects_watch_mode(

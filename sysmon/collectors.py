@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -24,11 +25,15 @@ from .models import (
     DiskStats,
     LoadAverage,
     MemoryStats,
+    NetworkStats,
+    ProcessInfo,
+    ProcessStats,
     Snapshot,
     UptimeStats,
 )
 
 CommandRunner = Callable[[Sequence[str]], str]
+MAX_TOP_PROCESSES = 5
 
 
 class MetricUnavailable(RuntimeError):
@@ -254,6 +259,81 @@ def parse_os_release(text: str) -> str | None:
     return values.get("PRETTY_NAME") or values.get("NAME") or None
 
 
+def parse_net_dev(text: str) -> NetworkStats:
+    """Parse /proc/net/dev and total all interfaces except loopback."""
+
+    entries: list[tuple[str, int, int]] = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        interface, raw = line.split(":", 1)
+        fields = raw.split()
+        if len(fields) < 9:
+            continue
+        try:
+            rx_bytes = int(fields[0])
+            tx_bytes = int(fields[8])
+        except ValueError:
+            continue
+        entries.append((interface.strip(), rx_bytes, tx_bytes))
+
+    if not entries:
+        raise MetricUnavailable("/proc/net/dev contains no interface rows")
+    non_loopback = [entry for entry in entries if entry[0] != "lo"]
+    selected = non_loopback or entries
+    return NetworkStats(
+        rx_bytes=sum(entry[1] for entry in selected),
+        tx_bytes=sum(entry[2] for entry in selected),
+        interfaces=len(selected),
+        source="/proc/net/dev",
+    )
+
+
+_PS_ROW = re.compile(
+    r"^\s*(\d+)\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s+(\d+)\s+(.+?)\s*$"
+)
+
+
+def parse_ps_processes(
+    text: str, limit: int = MAX_TOP_PROCESSES
+) -> tuple[ProcessInfo, ...]:
+    """Parse ``ps -eo pid=,pcpu=,rss=,comm=`` output."""
+
+    processes: list[ProcessInfo] = []
+    for line in text.splitlines():
+        match = _PS_ROW.match(line)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        cpu = float(match.group(2))
+        if not math.isfinite(cpu):
+            continue
+        rss_kb = int(match.group(3))
+        command = match.group(4).strip() or f"[{pid}]"
+        if command == "ps":
+            # The ps process itself often reports a misleading 100% CPU.
+            continue
+        processes.append(
+            ProcessInfo(
+                pid=pid,
+                command=command,
+                cpu_percent=max(0.0, cpu),
+                memory_bytes=max(0, rss_kb) * 1024,
+            )
+        )
+
+    if not processes:
+        raise MetricUnavailable("ps returned no parsable process rows")
+    processes.sort(
+        key=lambda process: (
+            process.cpu_percent or 0.0,
+            process.memory_bytes or 0,
+        ),
+        reverse=True,
+    )
+    return tuple(processes[:limit])
+
+
 class SystemCollector:
     """Collect one read-only snapshot of the host.
 
@@ -272,6 +352,7 @@ class SystemCollector:
         runner: CommandRunner | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.paths = tuple(Path(path) for path in paths) or (Path("/"),)
         self.proc_root = Path(proc_root)
@@ -281,13 +362,17 @@ class SystemCollector:
         self.runner = runner
         self.clock = clock
         self.sleep = sleep
+        self.monotonic = monotonic
+        self._last_network: tuple[float, int, int] | None = None
 
-    def collect(self) -> Snapshot:
+    def collect(self, detailed: bool = False) -> Snapshot:
         warnings: list[str] = []
         cpu = self._collect_cpu(warnings)
         memory = self._collect_memory(warnings)
         disks = self._collect_disks(warnings)
         uptime = self._collect_uptime(warnings)
+        network = self._collect_network(warnings) if detailed else None
+        processes = self._collect_processes(warnings) if detailed else None
 
         return Snapshot(
             timestamp=self.clock(),
@@ -295,6 +380,8 @@ class SystemCollector:
             memory=memory,
             disks=disks,
             uptime=uptime,
+            network=network,
+            processes=processes,
             warnings=tuple(warnings),
             hostname=platform.node().strip() or "unknown",
             os_name=self._read_os_name(),
@@ -433,6 +520,139 @@ class SystemCollector:
                 f"Uptime: /proc/uptime unavailable ({proc_error}); {exc}"
             )
             return None
+
+    def _collect_network(self, warnings: list[str]) -> NetworkStats | None:
+        try:
+            stats = parse_net_dev(_read_text(self.proc_root / "net" / "dev"))
+        except (OSError, ValueError, MetricUnavailable) as exc:
+            warnings.append(f"Network: {exc}")
+            return None
+
+        now = self.monotonic()
+        rx_rate: float | None = None
+        tx_rate: float | None = None
+        if self._last_network is not None:
+            previous_time, previous_rx, previous_tx = self._last_network
+            elapsed = now - previous_time
+            if (
+                elapsed > 0
+                and stats.rx_bytes >= previous_rx
+                and stats.tx_bytes >= previous_tx
+            ):
+                rx_rate = (stats.rx_bytes - previous_rx) / elapsed
+                tx_rate = (stats.tx_bytes - previous_tx) / elapsed
+        self._last_network = (now, stats.rx_bytes, stats.tx_bytes)
+
+        return NetworkStats(
+            rx_bytes=stats.rx_bytes,
+            tx_bytes=stats.tx_bytes,
+            rx_rate=rx_rate,
+            tx_rate=tx_rate,
+            interfaces=stats.interfaces,
+            source=stats.source,
+        )
+
+    def _collect_processes(self, warnings: list[str]) -> ProcessStats:
+        total: int | None = None
+        running: int | None = None
+        counts_error: str | None = None
+        try:
+            running, total = self._process_counts()
+        except (OSError, ValueError, MetricUnavailable) as exc:
+            counts_error = str(exc)
+
+        top: tuple[ProcessInfo, ...] = ()
+        top_source = "unavailable"
+        top_error: str | None = None
+        try:
+            top, top_source = self._read_top_processes()
+        except (OSError, ValueError, MetricUnavailable) as exc:
+            top_error = str(exc)
+
+        if top_error and total is None:
+            warnings.append(
+                "Processes: counts and top list unavailable "
+                f"({counts_error}; {top_error})"
+            )
+        elif top_error:
+            warnings.append(f"Processes: top list unavailable ({top_error})")
+        elif counts_error:
+            warnings.append(f"Processes: counts unavailable ({counts_error})")
+
+        return ProcessStats(
+            total=total,
+            running=running,
+            top=top,
+            source=top_source,
+        )
+
+    def _process_counts(self) -> tuple[int, int]:
+        total = 0
+        running = 0
+        for entry in self.proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            total += 1
+            try:
+                stat = _read_text(entry / "stat")
+                state = stat.rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                continue
+            if state == "R":
+                running += 1
+        if total == 0:
+            raise MetricUnavailable("/proc contains no process directories")
+        return running, total
+
+    def _read_top_processes(self) -> tuple[tuple[ProcessInfo, ...], str]:
+        ps_error: Exception | None = None
+        try:
+            output = self._run(("ps", "-eo", "pid=,pcpu=,rss=,comm="))
+            return parse_ps_processes(output), "ps"
+        except MetricUnavailable as exc:
+            ps_error = exc
+
+        try:
+            return self._top_processes_from_proc(), "/proc"
+        except (OSError, ValueError, MetricUnavailable) as exc:
+            raise MetricUnavailable(
+                f"ps unavailable ({ps_error}); /proc scan failed ({exc})"
+            ) from exc
+
+    def _top_processes_from_proc(self) -> tuple[ProcessInfo, ...]:
+        try:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError) as exc:
+            raise MetricUnavailable(f"cannot determine page size: {exc}") from exc
+
+        processes: list[ProcessInfo] = []
+        for entry in self.proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                statm = _read_text(entry / "statm").split()
+                resident_pages = int(statm[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            if resident_pages <= 0:
+                continue
+            try:
+                command = _read_text(entry / "comm").strip()
+            except OSError:
+                command = ""
+            pid = int(entry.name)
+            processes.append(
+                ProcessInfo(
+                    pid=pid,
+                    command=command or f"[{pid}]",
+                    memory_bytes=resident_pages * page_size,
+                )
+            )
+
+        if not processes:
+            raise MetricUnavailable("/proc contains no readable process data")
+        processes.sort(key=lambda process: process.memory_bytes or 0, reverse=True)
+        return tuple(processes[:MAX_TOP_PROCESSES])
 
     def _run(self, args: Sequence[str]) -> str:
         if self.runner is not None:

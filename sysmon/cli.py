@@ -41,7 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-w",
         "--watch",
         action="store_true",
-        help="refresh continuously until Ctrl+C (default: one snapshot)",
+        help=(
+            "refresh continuously with live network/process details "
+            "until Ctrl+C (default: one snapshot)"
+        ),
     )
     mode.add_argument(
         "--once",
@@ -68,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="print raw data as JSON instead of the dashboard",
+        help="print raw data as JSON, including network and process details",
     )
     parser.add_argument(
         "--ascii",
@@ -104,7 +107,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.json:
-            print(json.dumps(collector.collect().to_dict(), indent=2))
+            print(
+                json.dumps(
+                    collector.collect(detailed=True).to_dict(),
+                    indent=2,
+                )
+            )
             return 0
 
         if args.watch:
@@ -154,9 +162,12 @@ def _watch(
             refresh_per_second=4,
             vertical_overflow="ellipsis",
         ) as live:
+            started = time.monotonic()
+            samples = 0
             while True:
-                started = time.monotonic()
-                snapshot = collector.collect()
+                cycle_started = time.monotonic()
+                snapshot = collector.collect(detailed=True)
+                samples += 1
                 live.update(
                     render_dashboard(
                         snapshot,
@@ -164,10 +175,12 @@ def _watch(
                         ascii_bars=args.ascii,
                         live=True,
                         interval=args.interval,
+                        sample=samples,
+                        session_seconds=time.monotonic() - started,
                     ),
                     refresh=True,
                 )
-                elapsed = time.monotonic() - started
+                elapsed = time.monotonic() - cycle_started
                 time.sleep(max(0.0, args.interval - elapsed))
     except KeyboardInterrupt:
         console.print(Text("sysmon stopped.", style="dim"))

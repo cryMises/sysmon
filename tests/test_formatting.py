@@ -9,6 +9,7 @@ from sysmon.formatting import (
     format_duration,
     format_load,
     format_percent,
+    format_rate,
 )
 
 
@@ -54,3 +55,10 @@ def test_format_percent_and_load() -> None:
     assert format_percent(42.345, digits=0) == "42%"
     assert format_load(None) == "n/a"
     assert format_load(1.234) == "1.23"
+
+
+def test_format_rate() -> None:
+    assert format_rate(None) == "n/a"
+    assert format_rate(0) == "0 B/s"
+    assert format_rate(1536) == "1.5 KiB/s"
+    assert format_rate(2 * 1024**2) == "2.0 MiB/s"

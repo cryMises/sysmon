@@ -15,8 +15,17 @@ from .formatting import (
     format_duration,
     format_load,
     format_percent,
+    format_rate,
 )
-from .models import CpuStats, DiskStats, MemoryStats, Snapshot, UptimeStats
+from .models import (
+    CpuStats,
+    DiskStats,
+    MemoryStats,
+    NetworkStats,
+    ProcessStats,
+    Snapshot,
+    UptimeStats,
+)
 
 
 def render_dashboard(
@@ -26,11 +35,14 @@ def render_dashboard(
     ascii_bars: bool = False,
     live: bool = False,
     interval: float = 2.0,
+    sample: int | None = None,
+    session_seconds: float | None = None,
 ) -> Group:
     """Build the complete dashboard renderable.
 
     Two-column layout is used on wider terminals; narrow terminals (common in
-    Termux portrait mode) get a stacked layout.
+    Termux portrait mode) get a stacked layout. Network and process panels are
+    only shown in live mode.
     """
 
     wide = width >= 92
@@ -40,6 +52,8 @@ def render_dashboard(
     memory_panel = _memory_panel(snapshot.memory, bar_width, ascii_bars)
     disk_panel = _disk_panel(snapshot.disks, bar_width, ascii_bars)
     uptime_panel = _uptime_panel(snapshot.uptime, snapshot.timestamp)
+    network_panel = _network_panel(snapshot.network)
+    processes_panel = _processes_panel(snapshot.processes)
 
     parts: list[object] = [_header(snapshot), Rule(style="grey30")]
 
@@ -49,14 +63,25 @@ def render_dashboard(
         grid.add_column(ratio=1)
         grid.add_row(cpu_panel, memory_panel)
         grid.add_row(disk_panel, uptime_panel)
+        if live:
+            grid.add_row(network_panel, processes_panel)
         parts.append(grid)
     else:
         parts.extend([cpu_panel, memory_panel, disk_panel, uptime_panel])
+        if live:
+            parts.extend([network_panel, processes_panel])
 
     if snapshot.warnings:
         parts.append(_warnings_panel(snapshot.warnings))
 
-    parts.append(_footer(live=live, interval=interval))
+    parts.append(
+        _footer(
+            live=live,
+            interval=interval,
+            sample=sample,
+            session_seconds=session_seconds,
+        )
+    )
     return Group(*parts)
 
 
@@ -196,6 +221,88 @@ def _uptime_panel(uptime: UptimeStats | None, now: float) -> Panel:
     return _panel("Uptime", body, "green", uptime.source)
 
 
+def _network_panel(network: NetworkStats | None) -> Panel:
+    if network is None:
+        body = Text("Network data unavailable", style="yellow")
+        return _panel("Network", body, "bright_blue")
+
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(no_wrap=True, min_width=3)
+    table.add_column(ratio=1)
+    table.add_row(
+        Text("RX", style="bold bright_blue"),
+        _network_line(network.rx_bytes, network.rx_rate),
+    )
+    table.add_row(
+        Text("TX", style="bold bright_blue"),
+        _network_line(network.tx_bytes, network.tx_rate),
+    )
+    if network.interfaces:
+        noun = "interface" if network.interfaces == 1 else "interfaces"
+        table.add_row("", Text(f"{network.interfaces} {noun}", style="dim"))
+
+    return _panel("Network", table, "bright_blue", network.source)
+
+
+def _network_line(total: int, rate: float | None) -> Text:
+    line = Text()
+    line.append(format_bytes(total), style="bold")
+    line.append(" total", style="dim")
+    line.append("   ")
+    if rate is None:
+        line.append("rate pending", style="dim")
+    else:
+        line.append(format_rate(rate), style="bold cyan")
+    return line
+
+
+def _processes_panel(processes: ProcessStats | None) -> Panel:
+    if processes is None:
+        body = Text("Process data unavailable", style="yellow")
+        return _panel("Processes", body, "bright_yellow")
+
+    if processes.total is not None:
+        counts: list[str] = []
+        if processes.running is not None:
+            counts.append(f"{processes.running} running")
+        counts.append(f"{processes.total} processes")
+        summary = Text(" · ".join(counts), style="dim")
+    else:
+        summary = Text("process counts unavailable", style="dim")
+
+    if not processes.top:
+        body = Group(summary, Text("Top process list unavailable", style="dim"))
+        return _panel("Processes", body, "bright_yellow", processes.source)
+
+    table = Table(
+        box=None,
+        expand=True,
+        show_header=True,
+        header_style="dim",
+        pad_edge=False,
+        padding=(0, 1),
+    )
+    table.add_column("PID", justify="right", no_wrap=True, width=6)
+    table.add_column("COMMAND", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("CPU", justify="right", no_wrap=True, width=7)
+    table.add_column("MEM", justify="right", no_wrap=True, width=10)
+
+    for process in processes.top:
+        table.add_row(
+            str(process.pid),
+            Text(process.command, overflow="ellipsis", no_wrap=True),
+            format_percent(process.cpu_percent),
+            format_bytes(process.memory_bytes),
+        )
+
+    return _panel(
+        "Processes",
+        Group(summary, table),
+        "bright_yellow",
+        processes.source,
+    )
+
+
 def _warnings_panel(warnings: tuple[str, ...]) -> Panel:
     body = Group(
         *(
@@ -211,19 +318,34 @@ def _warnings_panel(warnings: tuple[str, ...]) -> Panel:
     )
 
 
-def _footer(*, live: bool, interval: float) -> Text:
-    if live:
-        return Text.assemble(
-            ("Ctrl+C", "bold"),
-            " to quit",
-            ("  ·  ", "dim"),
-            (f"refreshing every {interval:g}s", "dim"),
+def _footer(
+    *,
+    live: bool,
+    interval: float,
+    sample: int | None = None,
+    session_seconds: float | None = None,
+) -> Text:
+    if not live:
+        return Text(
+            "Run with --watch for live updates  ·  "
+            "--json for machine-readable output",
+            style="dim",
+            overflow="fold",
         )
-    return Text(
-        "Run with --watch for live updates  ·  --json for machine-readable output",
-        style="dim",
-        overflow="fold",
-    )
+
+    parts: list[str | tuple[str, str]] = [
+        ("Ctrl+C", "bold"),
+        " to quit",
+        ("  ·  ", "dim"),
+        (f"refresh {interval:g}s", "dim"),
+    ]
+    if sample is not None:
+        parts.extend([("  ·  ", "dim"), (f"sample #{sample}", "dim")])
+    if session_seconds is not None:
+        parts.extend(
+            [("  ·  ", "dim"), (f"watching {format_duration(session_seconds)}", "dim")]
+        )
+    return Text.assemble(*parts, overflow="fold")
 
 
 def _panel(

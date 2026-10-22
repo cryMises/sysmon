@@ -11,7 +11,12 @@ No root permissions, no writes, and no system settings are touched.
 - Disk usage for one or more paths.
 - Uptime and boot time.
 - One-shot dashboard or live-refreshing watch mode.
-- JSON output for scripting.
+- Watch mode adds live-only details:
+  - Network RX/TX totals and throughput rates.
+  - Running/total process counts.
+  - Top processes by CPU, with a `/proc` fallback sorted by memory.
+  - Sample counter, session duration, and refresh status.
+- JSON output for scripting, including network and process details.
 - Graceful degradation: missing `/proc` entries or external utilities produce a warning panel, not a traceback.
 - Responsive layout: side-by-side panels on wide terminals, stacked on narrow Termux screens.
 - ASCII bar mode and `--no-color` for limited terminals.
@@ -84,16 +89,32 @@ If installed with `pip install -e .`, replace `python -m sysmon` with `sysmon`.
 
 | Option | Description |
 | --- | --- |
-| `-w`, `--watch` | Refresh until `Ctrl+C`. Default is one snapshot. |
+| `-w`, `--watch` | Refresh until `Ctrl+C`, with network, process, and session details. Default is one snapshot. |
 | `--once` | Explicitly print one snapshot and exit. |
 | `-i`, `--interval SECONDS` | Watch refresh interval, minimum `0.5` (default `2.0`). |
 | `-p`, `--path PATH` | Filesystem path to report. Repeat for multiple paths. Default `/`. |
-| `--json` | Print raw data as JSON. Cannot be combined with `--watch`. |
+| `--json` | Print raw data as JSON, including network and process details. Cannot be combined with `--watch`. |
 | `--ascii` | Use `#`/`-` bars instead of Unicode blocks. |
 | `--no-color` | Disable colors. |
 | `--version` | Print the version. |
 
 When `--watch` is used without an interactive terminal, sysmon prints one snapshot and exits instead of looping. This keeps logs and pipes predictable.
+
+### Watch mode details
+
+`sysmon -w` refreshes the dashboard in an alternate screen and adds three live-only things:
+
+1. **Network** — RX/TX totals plus bytes-per-second rates. Loopback is excluded when other interfaces are present. The first frame says `rate pending`; later frames use counter deltas.
+2. **Processes** — running/total counts from `/proc`, plus the five busiest processes. CPU percentages come from `ps`; if `ps` is missing or unsupported, sysmon falls back to the five processes with the largest resident memory from `/proc` (CPU shows `n/a`).
+3. **Session footer** — refresh interval, sample number, and how long the watch session has been running.
+
+The footer looks like:
+
+```text
+Ctrl+C to quit  ·  refresh 2s  ·  sample #12  ·  watching 24s
+```
+
+Network accounting requires a readable `/proc/net/dev`. Some Android/PRoot setups block it; sysmon then shows `Network data unavailable` and a warning. Process details and session status still work. `ps` CPU values are lifetime averages, not a separate sampling window.
 
 ## Example output
 
@@ -119,6 +140,23 @@ Run with --watch for live updates  ·  --json for machine-readable output
 
 On a narrow terminal the four panels stack vertically.
 
+In live mode, two more panels are added below them:
+
+```text
+╭─ Network ─────────────────────────────────────╮ ╭─ Processes ────────────────────────────────────╮
+│ RX  5.0 GiB total   33.2 KiB/s                │ │ 2 running · 42 processes                       │
+│ TX  2.0 GiB total   8.3 KiB/s                 │ │    PID  COMMAND                CPU         MEM │
+│     2 interfaces                              │ │   1234  python               12.5%   512.0 MiB │
+╰─ src: /proc/net/dev ──────────────────────────╯ │   5678  opencode              6.1%   322.0 MiB │
+                                                  │   9012  bash                  0.4%    64.0 MiB │
+                                                  │   3456  node                  0.2%   128.0 MiB │
+                                                  │   7890  sshd                  0.1%    12.0 MiB │
+                                                  ╰─ src: ps ──────────────────────────────────────╯
+Ctrl+C to quit  ·  refresh 2s  ·  sample #12  ·  watching 24s
+```
+
+The footer tracks samples and watch-session time. Network rates appear from the second frame onward.
+
 ## How data is collected
 
 sysmon is read-only. It prefers `/proc` and the Python standard library, then falls back to read-only commands only when the primary source is unavailable and the command exists.
@@ -130,15 +168,18 @@ sysmon is read-only. It prefers `/proc` and the Python standard library, then fa
 | Memory / swap | `/proc/meminfo` | `free -b` | `n/a` + warning |
 | Disk | `shutil.disk_usage` (`statvfs`) | `df -Pk PATH` | skipped path + warning |
 | Uptime | `/proc/uptime` | `uptime -s` | `n/a` + warning |
+| Network (watch/JSON) | `/proc/net/dev` | none | `n/a` + warning |
+| Process counts (watch/JSON) | `/proc/[pid]/stat` | none | `n/a` |
+| Top processes (watch/JSON) | `ps -eo pid=,pcpu=,rss=,comm=` | `/proc/[pid]/statm` sorted by RSS | panel unavailable |
 
 External commands:
 
 - Run without a shell, with a 2-second timeout.
 - Receive `LC_ALL=C` for stable parsing.
-- Are never required for the app to start.
-- Are only used when the primary source fails.
+- Are optional: `free`, `df`, and `uptime` are fallbacks, while `ps` supplies top-process CPU data.
+- Never block the app from starting when missing.
 
-CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can be under PRoot/Android, sysmon shows the average since boot with an explicit source label rather than inventing an instantaneous value.
+CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can be under PRoot/Android, sysmon shows the average since boot with an explicit source label rather than inventing an instantaneous value. Network totals need a readable `/proc/net/dev`; process statistics still work when Android blocks it.
 
 ## JSON
 
@@ -176,11 +217,32 @@ CPU usage takes a short sample (`0.12s`). If `/proc/stat` is frozen, as it can b
     "boot_time": "2026-10-21T21:26:30+07:00",
     "source": "/proc/uptime"
   },
+  "network": {
+    "rx_bytes": 5368709120,
+    "tx_bytes": 2147483648,
+    "rx_bytes_per_sec": null,
+    "tx_bytes_per_sec": null,
+    "interfaces": 2,
+    "source": "/proc/net/dev"
+  },
+  "processes": {
+    "total": 42,
+    "running": 2,
+    "top": [
+      {
+        "pid": 1234,
+        "command": "python",
+        "cpu_percent": 12.5,
+        "memory_bytes": 536870912
+      }
+    ],
+    "source": "ps"
+  },
   "warnings": []
 }
 ```
 
-Timestamps are local ISO 8601. Sizes are bytes; percentages are rounded to one decimal. The real output includes every field from the models (for example `available_bytes`, `free_bytes`, and swap fields).
+Timestamps are local ISO 8601. Sizes are bytes; percentages are rounded to one decimal. The real output includes every field from the models (for example `available_bytes`, `free_bytes`, and swap fields). `--json` collects a detailed single sample, so throughput rates are `null` because there is no previous sample to diff against.
 
 ## Tests
 
@@ -191,22 +253,24 @@ python -m pytest
 
 The suite covers:
 
-- Byte/duration/percent formatting.
-- `/proc/loadavg`, `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `df -Pk`, `free -b`, and `os-release` parsing.
+- Byte/duration/percent/rate formatting.
+- `/proc/loadavg`, `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/net/dev`, `ps`, `df -Pk`, `free -b`, and `os-release` parsing.
 - CPU delta and since-boot calculations.
+- Network rate calculations across samples.
+- Process counts and `/proc` top-process fallback.
 - Command fallbacks with a fake runner.
 - Missing `/proc` files and missing utilities, asserting warnings instead of crashes.
-- Dashboard rendering at wide and narrow widths, ASCII bars, and warning escapes.
+- Dashboard rendering at wide and narrow widths, live-only panels, ASCII bars, and warning escapes.
 - CLI one-shot, JSON, option validation, path expansion, and non-TTY watch behavior.
 
 Current result on Ubuntu 26.04 aarch64 / Python 3.14 / Rich 15:
 
 ```text
-.............................................
-45 passed
+...........................................................
+59 passed
 ```
 
-Interactive watch was also exercised under a pseudo-terminal: it rendered multiple live frames, handled `Ctrl+C`, printed `sysmon stopped.`, and exited with code 0.
+Interactive watch was also exercised under a pseudo-terminal: it rendered multiple live frames with network/process/session panels, handled `Ctrl+C`, printed `sysmon stopped.`, and exited with code 0.
 
 ## Project layout
 
@@ -241,16 +305,19 @@ To add a metric:
 - **No root**: sysmon only reads files and calls read-only utilities. It does not change kernel settings, files, or services.
 - **Container values**: inside PRoot, `/proc` reflects the shared kernel/container view, not necessarily every Android host statistic. Frozen `/proc/stat` counters are handled with the boot-average fallback.
 - **Restricted storage**: Android scoped storage may block paths such as `/sdcard`. Point `--path` at an accessible directory; inaccessible paths appear as warnings.
-- **No history**: there are no charts or retained samples. Each refresh is independent.
-- **No process list**: sysmon intentionally focuses on host-level CPU, memory, disk, and uptime.
+- **Restricted networking**: Android and some PRoot setups deny access to `/proc/net/dev`; the Network panel then shows unavailable and a warning. Network accounting works on standard Ubuntu hosts.
+- **No history**: there are no charts or retained samples. Each refresh is independent; only network rates need the previous sample.
+- **Process scope**: watch mode shows counts and the top five processes, not a full process browser. `ps` CPU percentages are lifetime averages; the `/proc` fallback ranks by resident memory and leaves CPU as `n/a`.
 - **Disk space semantics**: usage comes from `statvfs` when possible, so reserved blocks can make `used + free` differ slightly from `total`.
 - **Colors**: Rich disables color automatically when output is redirected. Use `--no-color` or `--ascii` on limited terminals.
-- **Sampling cost**: one snapshot blocks for about `0.12s` to measure CPU usage. Watch mode enforces a minimum interval of `0.5s`.
+- **Sampling cost**: one snapshot blocks for about `0.12s` to measure CPU usage. Detailed watch/JSON collection also runs process and network queries, so watch mode enforces a minimum interval of `0.5s`.
 
 ## Troubleshooting
 
 - `ModuleNotFoundError: No module named 'rich'`: install `requirements.txt` with the same Python interpreter used to run sysmon (activate the venv first).
 - `ensurepip is not available` in Ubuntu: install `python3-venv` once, then recreate `.venv`.
 - CPU usage shows `n/a`: `/proc/stat` is unreadable. CPU load can still be shown if `/proc/loadavg` or `os.getloadavg()` works.
+- Network shows unavailable: `/proc/net/dev` is blocked by the Android/proot sandbox. This is expected in some Termux setups; the rest of the dashboard still works.
+- Processes show `n/a` for CPU: `ps` is unavailable or incompatible, so top processes come from `/proc` memory usage.
 - Disk panel shows a warning: the path is not visible to the current user/container. Try `--path "$HOME"`.
 - Watch mode exits immediately: stdout is not a TTY. Run it directly in Termux, not through a pipe or log redirect.
