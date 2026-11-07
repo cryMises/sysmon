@@ -166,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the termux-battery-status query",
     )
     parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="skip the docker stats query for running containers",
+    )
+    parser.add_argument(
         "--no-trends",
         action="store_true",
         help="disable the in-memory watch-mode trend strips",
@@ -246,6 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if config.battery and not args.no_battery
         else None
     )
+    docker_enabled = config.docker and not args.no_docker
     collector = SystemCollector(
         paths=paths,
         process_limit=process_limit,
@@ -253,6 +259,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         process_filter=process_pattern,
         full_command=full_command,
         battery_command=battery_command,
+        docker_command=(
+            ("docker", "stats", "--no-stream", "--format", "{{json .}}")
+            if docker_enabled
+            else None
+        ),
     )
     console = Console(
         highlight=False,

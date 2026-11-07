@@ -1,0 +1,1 @@
+{"battery":false,"docker":true,"interval":2,"paths":["/"],"processes":{"limit":8,"sort":"mem"},"thresholds":{"memory":{"critical":92,"warning":80}}}

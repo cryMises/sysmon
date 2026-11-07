@@ -274,6 +274,43 @@ class BatteryStats:
 
 
 @dataclass(frozen=True)
+class ContainerStats:
+    """One running Docker container, as reported by ``docker stats``."""
+
+    name: str
+    cpu_percent: float | None = None
+    memory_bytes: int | None = None
+    memory_limit_bytes: int | None = None
+
+    @property
+    def memory_percent(self) -> float | None:
+        return _percent(self.memory_bytes, self.memory_limit_bytes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "cpu_percent": _rounded(self.cpu_percent),
+            "memory_bytes": self.memory_bytes,
+            "memory_limit_bytes": self.memory_limit_bytes,
+            "memory_percent": _rounded(self.memory_percent),
+        }
+
+
+@dataclass(frozen=True)
+class DockerStats:
+    containers: tuple[ContainerStats, ...] = ()
+    source: str = "docker stats"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "containers": [
+                container.to_dict() for container in self.containers
+            ],
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """A complete, immutable sample of the host."""
 
@@ -289,6 +326,7 @@ class Snapshot:
     os_name: str
     machine: str
     battery: BatteryStats | None = None
+    docker: DockerStats | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -305,6 +343,7 @@ class Snapshot:
             "network": self.network.to_dict() if self.network else None,
             "processes": self.processes.to_dict() if self.processes else None,
             "battery": self.battery.to_dict() if self.battery else None,
+            "docker": self.docker.to_dict() if self.docker else None,
             "warnings": list(self.warnings),
         }
         return data

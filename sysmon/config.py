@@ -40,6 +40,7 @@ class AppConfig:
     interval: float = 2.0
     paths: tuple[Path, ...] = ()
     battery: bool = True
+    docker: bool = True
     processes: ProcessSettings = ProcessSettings()
     trends: TrendSettings = TrendSettings()
     thresholds: Thresholds = field(default_factory=Thresholds)
@@ -71,6 +72,7 @@ def parse_config(raw: object) -> AppConfig:
             "interval",
             "paths",
             "battery",
+            "docker",
             "processes",
             "trends",
             "thresholds",
@@ -83,6 +85,7 @@ def parse_config(raw: object) -> AppConfig:
     interval = _number(data.get("interval", 2.0), "interval", minimum=0.5)
     paths = _paths(data.get("paths"))
     battery = _boolean(data.get("battery", True), "battery")
+    docker = _boolean(data.get("docker", True), "docker")
     processes = _processes(data.get("processes", {}))
     trends = _trends(data.get("trends", {}))
     thresholds = _thresholds(data.get("thresholds", {}))
@@ -93,6 +96,7 @@ def parse_config(raw: object) -> AppConfig:
         interval=interval,
         paths=paths,
         battery=battery,
+        docker=docker,
         processes=processes,
         trends=trends,
         thresholds=thresholds,
