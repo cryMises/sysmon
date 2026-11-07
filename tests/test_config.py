@@ -72,6 +72,11 @@ def test_load_full_config(tmp_path: Path) -> None:
     assert config.no_color is True
 
 
+def test_docker_can_be_disabled_in_config() -> None:
+    assert parse_config({}).docker is True
+    assert parse_config({"docker": False}).docker is False
+
+
 def test_load_empty_config_uses_defaults(tmp_path: Path) -> None:
     path = tmp_path / "empty.json"
     path.write_text("{}")

@@ -6,6 +6,8 @@ from rich.console import Console
 
 from sysmon.dashboard import render_dashboard
 from sysmon.models import (
+    ContainerStats,
+    DockerStats,
     MetricThreshold,
     NetworkInterfaceStats,
     Snapshot,
@@ -130,6 +132,31 @@ def test_live_mode_adds_network_process_and_session_details(
     assert "512.0 MiB" in output
     assert "sample #4" in output
     assert "watching 12s" in output
+
+
+def test_live_mode_shows_docker_containers(live_snapshot: Snapshot) -> None:
+    snapshot = replace(
+        live_snapshot,
+        docker=DockerStats(
+            containers=(
+                ContainerStats(
+                    name="n8n-n8n-1",
+                    cpu_percent=41.65,
+                    memory_bytes=int(369.4 * 1024**2),
+                    memory_limit_bytes=int(887.1 * 1024**2),
+                ),
+            )
+        ),
+    )
+    output = _render(snapshot, width=110, live=True, sample=1)
+
+    assert "Docker" in output
+    assert "1 running container" in output
+    assert "n8n-n8n-1" in output
+    assert "41.6%" in output
+
+    one_shot = _render(snapshot, width=110, live=False)
+    assert "Docker" not in one_shot
 
 
 def test_live_panels_are_hidden_in_one_shot_mode(live_snapshot: Snapshot) -> None:
