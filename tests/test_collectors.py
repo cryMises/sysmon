@@ -24,6 +24,8 @@ from sysmon.collectors import (
     parse_cgroup_memory_limit,
     parse_cpu_stat,
     parse_df_k,
+    parse_docker_size,
+    parse_docker_stats,
     parse_free_bytes,
     parse_ip_link_json,
     parse_loadavg,
@@ -1169,6 +1171,62 @@ def test_network_reports_all_sources_when_unavailable(
     assert "/proc/net/dev unavailable" in warnings[0]
     assert "sysfs unavailable" in warnings[0]
     assert "ip" in warnings[0]
+
+
+DOCKER_STATS = """\
+{"Name":"n8n-n8n-1","CPUPerc":"41.65%","MemUsage":"369.4MiB / 887.1MiB","MemPerc":"41.65%"}
+{"Name":"n8n-caddy-1","CPUPerc":"0.05%","MemUsage":"14.6MiB / 887.1MiB","MemPerc":"1.65%"}
+this line is not json
+{"CPUPerc":"1.00%"}
+"""
+
+
+def test_parse_docker_size_units() -> None:
+    assert parse_docker_size("512B") == 512
+    assert parse_docker_size("1.5KiB") == 1536
+    assert parse_docker_size("369.4MiB") == int(369.4 * 1024**2)
+    assert parse_docker_size("2GB") == 2 * 1000**3
+    assert parse_docker_size("lots") is None
+    assert parse_docker_size("12XB") is None
+
+
+def test_parse_docker_stats_rows() -> None:
+    stats = parse_docker_stats(DOCKER_STATS)
+
+    assert [container.name for container in stats.containers] == [
+        "n8n-n8n-1",
+        "n8n-caddy-1",
+    ]
+    first = stats.containers[0]
+    assert first.cpu_percent == 41.65
+    assert first.memory_bytes == int(369.4 * 1024**2)
+    assert first.memory_limit_bytes == int(887.1 * 1024**2)
+    assert first.memory_percent == pytest.approx(41.6, abs=0.2)
+
+
+def test_collect_docker_uses_runner() -> None:
+    def runner(args: Sequence[str]) -> str:
+        if args[0] == "docker":
+            return DOCKER_STATS
+        raise AssertionError(f"unexpected command: {args}")
+
+    collector = SystemCollector(runner=runner, battery_command=None)
+    stats = collector._collect_docker()
+
+    assert stats is not None
+    assert len(stats.containers) == 2
+    assert stats.containers[0].name == "n8n-n8n-1"
+
+
+def test_collect_docker_hides_unavailable_docker() -> None:
+    def runner(args: Sequence[str]) -> str:
+        raise RuntimeError("daemon unreachable")
+
+    collector = SystemCollector(runner=runner, battery_command=None)
+    assert collector._collect_docker() is None
+
+    disabled = SystemCollector(docker_command=None, battery_command=None)
+    assert disabled._collect_docker() is None
 
 
 def test_detailed_collection_includes_live_metrics(tmp_path: Path) -> None:
