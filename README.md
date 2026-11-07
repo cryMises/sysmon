@@ -65,6 +65,39 @@ Optional editable install to get a `sysmon` command:
 python -m pip install -e .
 ```
 
+### Plain Ubuntu VM (e.g. Azure)
+
+On a regular cloud VM there is no Termux and no battery; sysmon detects
+that on its own (the battery panel hides itself, and the Android/PRoot
+fallbacks stay unused because the real `/proc` counters work). Install
+and run it the same way:
+
+```bash
+git clone --branch azure-vm https://github.com/cryMises/sysmon.git
+cd sysmon
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
+sysmon --watch
+```
+
+The `azure-vm` branch adds one thing a VM host wants: a **Docker panel**
+(live mode and JSON only) listing each running container with its CPU %
+and memory usage/limit, read from
+`docker stats --no-stream --format {{json .}}`. The panel is
+best-effort — if Docker is missing, stopped, or the socket is not
+readable by your user, it hides itself instead of warning. Reading the
+Docker socket requires membership of the `docker` group (or running
+sysmon with `sudo`); disable the panel entirely with `--no-docker` or
+`"docker": false` in the config file.
+
+`config.vm.json` in this branch is a ready-made config for a small
+Docker host — root disk only, battery off, processes sorted by memory:
+
+```bash
+sysmon --watch --config config.vm.json
+```
+
 ## Run
 
 One snapshot (the default):
@@ -115,6 +148,7 @@ If installed with `pip install -e .`, replace `python -m sysmon` with `sysmon`.
 | `--full-command` | Show the full command line instead of only the process name. |
 | `--json` | Print raw data as JSON. With `--watch`, emit JSON Lines instead of the dashboard. |
 | `--no-battery` | Skip the `termux-battery-status` query. |
+| `--no-docker` | Skip the `docker stats` query for running containers (`azure-vm` branch). |
 | `--no-trends` | Disable the in-memory watch-mode trend strips. |
 | `--trend-samples N` | Number of trend samples to retain, `2`–`1000` (default `60`). |
 | `--count N` | Stop watch/JSON Lines after `N` samples. |

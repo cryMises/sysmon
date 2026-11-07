@@ -25,6 +25,7 @@ from .models import (
     CpuClusterStats,
     CpuStats,
     DiskStats,
+    DockerStats,
     MemoryStats,
     MetricThreshold,
     NetworkInterfaceStats,
@@ -75,6 +76,7 @@ def render_dashboard(
     )
     network_panel = _network_panel(snapshot.network)
     processes_panel = _processes_panel(snapshot.processes)
+    docker_panel = _docker_panel(snapshot.docker)
     trends_panel = _trends_panel(trends, width, ascii_bars) if live else None
     alerts = _collect_alerts(snapshot, thresholds)
 
@@ -105,6 +107,8 @@ def render_dashboard(
             parts.append(live_grid)
         else:
             parts.extend([network_panel, processes_panel])
+        if docker_panel is not None:
+            parts.append(docker_panel)
 
     if snapshot.warnings:
         parts.append(_warnings_panel(snapshot.warnings))
@@ -707,6 +711,44 @@ def _processes_panel(processes: ProcessStats | None) -> Panel:
         Group(summary, table),
         "bright_yellow",
         processes.source,
+    )
+
+
+def _docker_panel(docker: DockerStats | None) -> Panel | None:
+    if docker is None or not docker.containers:
+        return None
+
+    noun = "container" if len(docker.containers) == 1 else "containers"
+    summary = Text(f"{len(docker.containers)} running {noun}", style="dim")
+
+    table = Table(
+        box=None,
+        expand=True,
+        show_header=True,
+        header_style="dim",
+        pad_edge=False,
+        padding=(0, 1),
+    )
+    table.add_column("CONTAINER", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("CPU", justify="right", no_wrap=True, width=7)
+    table.add_column("MEM", justify="right", no_wrap=True, width=10)
+    table.add_column("LIMIT", justify="right", no_wrap=True, width=10)
+    table.add_column("MEM %", justify="right", no_wrap=True, width=6)
+
+    for container in docker.containers:
+        table.add_row(
+            Text(container.name, overflow="ellipsis", no_wrap=True),
+            format_percent(container.cpu_percent),
+            format_bytes(container.memory_bytes),
+            format_bytes(container.memory_limit_bytes),
+            format_percent(container.memory_percent),
+        )
+
+    return _panel(
+        "Docker",
+        Group(summary, table),
+        "bright_magenta",
+        docker.source,
     )
 
 
