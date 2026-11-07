@@ -23,9 +23,11 @@ from pathlib import Path
 
 from .models import (
     BatteryStats,
+    ContainerStats,
     CpuClusterStats,
     CpuStats,
     DiskStats,
+    DockerStats,
     LoadAverage,
     MemoryStats,
     NetworkInterfaceStats,
@@ -647,6 +649,82 @@ def parse_ps_processes(
     return tuple(_sort_processes(selected, sort_by)[:limit])
 
 
+_DOCKER_SIZE_UNITS = {
+    "B": 1,
+    "KB": 1000,
+    "MB": 1000**2,
+    "GB": 1000**3,
+    "TB": 1000**4,
+    "KIB": 1024,
+    "MIB": 1024**2,
+    "GIB": 1024**3,
+    "TIB": 1024**4,
+}
+
+
+def parse_docker_size(text: str) -> int | None:
+    """Parse a Docker human size such as ``369.4MiB`` into bytes."""
+
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*", text)
+    if match is None:
+        return None
+    factor = _DOCKER_SIZE_UNITS.get(match.group(2).upper())
+    if factor is None:
+        return None
+    return int(float(match.group(1)) * factor)
+
+
+def _parse_docker_percent(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(value.strip().rstrip("%"))
+    except ValueError:
+        return None
+
+
+def parse_docker_stats(text: str) -> DockerStats:
+    """Parse ``docker stats --no-stream --format {{json .}}`` output.
+
+    Malformed lines are skipped rather than failing the whole snapshot:
+    one odd container row should not hide the rest of the host.
+    """
+
+    containers: list[ContainerStats] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            raw = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("Name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        memory_bytes: int | None = None
+        memory_limit_bytes: int | None = None
+        usage = raw.get("MemUsage")
+        if isinstance(usage, str) and "/" in usage:
+            used_text, _, limit_text = usage.partition("/")
+            memory_bytes = parse_docker_size(used_text)
+            memory_limit_bytes = parse_docker_size(limit_text)
+        containers.append(
+            ContainerStats(
+                name=name.strip().lstrip("/"),
+                cpu_percent=_parse_docker_percent(raw.get("CPUPerc")),
+                memory_bytes=memory_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+        )
+    containers.sort(
+        key=lambda container: container.memory_bytes or 0, reverse=True
+    )
+    return DockerStats(containers=tuple(containers))
+
+
 def _sort_processes(
     processes: Sequence[ProcessInfo], sort_by: str
 ) -> list[ProcessInfo]:
@@ -704,6 +782,14 @@ class SystemCollector:
         battery_command: Sequence[str] | None = ("termux-battery-status",),
         battery_timeout: float = 5.0,
         battery_cache_seconds: float = 30.0,
+        docker_command: Sequence[str] | None = (
+            "docker",
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{json .}}",
+        ),
+        docker_timeout: float = 10.0,
         runner: CommandRunner | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -739,6 +825,8 @@ class SystemCollector:
         self.battery_command = tuple(battery_command) if battery_command else None
         self.battery_timeout = max(0.1, battery_timeout)
         self.battery_cache_seconds = max(0.0, battery_cache_seconds)
+        self.docker_command = tuple(docker_command) if docker_command else None
+        self.docker_timeout = max(0.1, docker_timeout)
         self.runner = runner
         self.clock = clock
         self.sleep = sleep
@@ -763,6 +851,7 @@ class SystemCollector:
         network = self._collect_network(warnings) if detailed else None
         processes = self._collect_processes(warnings) if detailed else None
         battery = self._collect_battery(warnings)
+        docker = self._collect_docker() if detailed else None
 
         return Snapshot(
             timestamp=self.clock(),
@@ -777,6 +866,7 @@ class SystemCollector:
             os_name=self._read_os_name(),
             machine=platform.machine().strip() or "unknown",
             battery=battery,
+            docker=docker,
         )
 
     def _collect_cpu(
@@ -1209,6 +1299,28 @@ class SystemCollector:
                 f"Uptime: /proc/uptime unavailable ({proc_error}); {exc}"
             )
             return None
+
+    def _collect_docker(self) -> DockerStats | None:
+        """Read running containers via the Docker CLI, when available.
+
+        Docker is optional host tooling, so every failure mode — no
+        binary, a stopped daemon, a socket the current user may not
+        read, zero running containers — simply hides the panel instead
+        of warning on every refresh.
+        """
+
+        if self.docker_command is None:
+            return None
+        if self.runner is None and shutil.which(self.docker_command[0]) is None:
+            return None
+        try:
+            output = self._run(
+                self.docker_command, timeout=self.docker_timeout
+            )
+        except MetricUnavailable:
+            return None
+        stats = parse_docker_stats(output)
+        return stats if stats.containers else None
 
     def _collect_battery(self, warnings: list[str]) -> BatteryStats | None:
         """Read battery state via Termux:API, caching slow command results."""
